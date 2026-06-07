@@ -1,0 +1,67 @@
+# Standalone CI for this service repo. Builds its own Dockerfile (SDK/context-mode
+# vendored in-repo), pushes to the in-cluster registry, then bumps the image tag in
+# infrastructure/deploy (Flux reconciles). Keeps at most ONE local image per service.
+
+variables:
+  REGISTRY: localhost:5000
+  DEPLOY_REPO: ssh://git@10.29.71.1:41922/infrastructure/deploy.git
+
+stages:
+  - build
+  - deploy
+
+.build-and-push:
+  stage: build
+  tags: [shell]
+  script:
+    - IMAGE="${REGISTRY}/${SERVICE}"
+    - docker build -f ${DOCKERFILE} -t ${IMAGE}:${CI_COMMIT_SHORT_SHA} -t ${IMAGE}:latest ${BUILD_CONTEXT}
+    - docker push ${IMAGE}:${CI_COMMIT_SHORT_SHA}
+    - docker push ${IMAGE}:latest
+    - |
+      docker images "${IMAGE}" --format '{{.Repository}}:{{.Tag}}@{{.ID}}' \
+        | grep -v ":${CI_COMMIT_SHORT_SHA}@" | cut -d@ -f1 \
+        | xargs -r docker rmi -f || true
+    - docker image prune -f || true
+    - docker builder prune -f --keep-storage=5GB || true
+
+.deploy:
+  stage: deploy
+  tags: [shell]
+  script:
+    - |
+      TMPDIR=$(mktemp -d)
+      SSH_CMD="ssh -i /root/.ssh/flux-deploy -o StrictHostKeyChecking=no"
+      GIT_SSH_COMMAND="${SSH_CMD}" git clone ${DEPLOY_REPO} ${TMPDIR}
+      cd ${TMPDIR}
+      git config user.email "ci@deploy.local"
+      git config user.name "GitLab CI"
+      for attempt in 1 2 3 4 5; do
+        git reset --hard origin/main
+        GIT_SSH_COMMAND="${SSH_CMD}" git pull --rebase origin main
+        find apps/ -name deployment.yaml -exec \
+          sed -i "s|image: ${REGISTRY}/${SERVICE}:.*|image: ${REGISTRY}/${SERVICE}:${CI_COMMIT_SHORT_SHA}|" {} +
+        git add -A
+        if git diff --cached --quiet; then echo "No image change for ${SERVICE}"; break; fi
+        git commit -m "deploy: ${SERVICE} ${CI_COMMIT_SHORT_SHA}"
+        if GIT_SSH_COMMAND="${SSH_CMD}" git push origin main; then echo "pushed (attempt ${attempt})"; break; fi
+        echo "push failed ${attempt}/5"; sleep 1
+      done
+      rm -rf ${TMPDIR}
+
+build:
+  extends: .build-and-push
+  variables:
+    SERVICE: orchestrator
+    DOCKERFILE: Dockerfile
+    BUILD_CONTEXT: "."
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+deploy:
+  extends: .deploy
+  variables:
+    SERVICE: orchestrator
+  needs: [build]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
