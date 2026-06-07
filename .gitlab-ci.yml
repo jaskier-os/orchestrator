@@ -1,6 +1,6 @@
 # Standalone CI for this service repo. Builds its own Dockerfile (SDK/context-mode
-# vendored in-repo), pushes to the in-cluster registry, then bumps the image tag in
-# infrastructure/deploy (Flux reconciles). Keeps at most ONE local image per service.
+# vendored in-repo) with buildx --push (build+push atomic, no local image kept),
+# then bumps the image tag in infrastructure/deploy (Flux reconciles).
 
 variables:
   REGISTRY: localhost:5000
@@ -15,13 +15,7 @@ stages:
   tags: [shell]
   script:
     - IMAGE="${REGISTRY}/${SERVICE}"
-    - docker build -f ${DOCKERFILE} -t ${IMAGE}:${CI_COMMIT_SHORT_SHA} -t ${IMAGE}:latest ${BUILD_CONTEXT}
-    - docker push ${IMAGE}:${CI_COMMIT_SHORT_SHA}
-    - docker push ${IMAGE}:latest
-    - |
-      docker images "${IMAGE}" --format '{{.Repository}}:{{.Tag}}@{{.ID}}' \
-        | grep -v ":${CI_COMMIT_SHORT_SHA}@" | cut -d@ -f1 \
-        | xargs -r docker rmi -f || true
+    - docker buildx build -f ${DOCKERFILE} -t ${IMAGE}:${CI_COMMIT_SHORT_SHA} -t ${IMAGE}:latest --push ${BUILD_CONTEXT}
     - docker image prune -f || true
     - docker builder prune -f --keep-storage=5GB || true
 
