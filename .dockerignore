@@ -1,0 +1,8 @@
+node_modules
+sdk/node_modules
+.env
+*.log
+.git
+.vscode
+*.md
+.DS_Store

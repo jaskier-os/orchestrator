@@ -1,0 +1,29 @@
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+
+# Dependencies
+node_modules/
+sdk/node_modules/
+
+# Runtime data
+data/chat-history/
+data/copilot-history/
+
+# Certificates / keys (never commit)
+*.pem
+*.crt
+*.key
+*.p12
+*.pfx
+
+# Logs and caches
+*.log
+.cache/
+coverage/
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store

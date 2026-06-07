@@ -1,0 +1,21 @@
+{
+  "name": "@orchestrator/sdk",
+  "version": "1.0.0",
+  "description": "Shared SDK for orchestrator and agents - types, protocol, base classes",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./base-agent": "./base-agent.js",
+    "./protocol": "./protocol.js",
+    "./types": "./types.js",
+    "./ptc-client": "./ptc-client.js",
+    "./tool-calling-client": "./tool-calling-client.js",
+    "./code-engine": "./code-engine.js",
+    "./device-tools": "./device-tools.js",
+    "./proxy": "./proxy.js"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  }
+}
