@@ -1,0 +1,6 @@
+User prompt:
+Посмотри какие рестораны есть рядом и отправь мне ссылки на них в телеграме
+
+Expected response:
+<tool_calls_to_mapkit_to_find_restaurants>
+I have found several restaurants, I added links to them to your Saved messages.

@@ -1,0 +1,5 @@
+User prompt:
+Whats on that photo?
+
+Expected result:
+That seems like a messages in telegram from different channels. I ran it through OCR and here are the text it extracted: <OCR_extracted_text>

@@ -1,0 +1,6 @@
+User prompt:
+Setup an alarm on 19:30 for me to drink water
+
+Expected result:
+<setup_alarm>: Time: 19:30 Title: Drink water
+I have set an alarm on 19 30 for you to drink water

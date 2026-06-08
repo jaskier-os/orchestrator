@@ -1,0 +1,16 @@
+User prompt:
+Кто этот человек? 
+
+Expected response:
+<identify_person_tool_call>
+<tool result image: AI/mock-data/Example_Reid.jpg>
+
+Expected response:
+That person was not found / was found with confidence 90%, but no data found. Do you want to run full analysis?
+
+User prompt:
+Давай.
+
+Expected response:
+<lookup_person_tool_call>
+I am 80% confident that this person is Ekaterina Klimova, 27 years old, phone number +7 916 200 10 10

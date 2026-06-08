@@ -1,0 +1,21 @@
+User prompt (in a new chat):
+Добавь задачу помыть посуду
+Expected result:
+<todo_create_tool_call>
+Ok, I created a task for you.
+
+User prompt (in a new chat)
+Я помыл посуду
+
+Expected result:
+<AI sees current tasks in todo>
+<todo_check_tool_call>
+Good job, I marked it as done.
+
+User prompt (in a new chat):
+Измени задачу с мытья посуды на поход за продуктами
+
+Expected result:
+<AI sees current tasks in todo>
+<todo_modify_tool_call>
+Ok, I changed task.

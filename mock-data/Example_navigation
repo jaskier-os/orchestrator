@@ -1,0 +1,14 @@
+User prompt 1:
+Найди ближайший ресторан ко мне
+
+Expected response 1:
+I found this restaurant for you: ...
+
+User prompt 2:
+Веди меня туда / давай пойдём туда / я хочу туда
+
+Expected response 2:
+Ok! <tool_call_to_yandex> It's in 100 meters.
+
+Expected result:
+Yandex map navigation started within the phone and glasses apps.
