@@ -1,113 +1,56 @@
-# AI Orchestrator
+# orchestrator
 
-Central AI orchestrator that routes requests from client devices (phone, glasses,
-desktop) to specialized agents and back-end services. It exposes an HTTP + WebSocket
-gateway, manages chat/remote-control sessions, classifies and dispatches requests,
-aggregates streaming responses, and coordinates speech (STT/TTS) and translation
-services. Agents connect to the orchestrator over WebSocket using the shared
-`@orchestrator/sdk` (vendored in `./sdk`).
+## What it is
 
-This repository is also the canonical home of `@orchestrator/sdk`. Other repos that
-need the SDK vendor a point-in-time copy of the `sdk/` folder from here.
+The central router. Client devices (phone, glasses, desktop) connect here and it
+dispatches to the specialized backend services - communicator (LLM), STT,
+translation, TTS, ReID analytics - holds session/chat state in MongoDB, and
+streams results back over HTTP and WebSocket. Koa server.
 
-## Prerequisites
+This repo is also the canonical home of `@orchestrator/sdk`, which lives in
+`./sdk` and is consumed by the agents. The orchestrator depends on it via
+`file:./sdk`, so the version here is the source.
 
-- Node.js 20+ (the Dockerfile uses `node:20-alpine`).
-- npm (ships with Node).
-- MongoDB reachable at `MONGO_URL` (defaults to `mongodb://localhost:27017`).
-- `ffmpeg` available on `PATH` for audio handling (the Docker image installs it).
-- Peer services (Communicator, TTS, transcriber, translator, ReID analytics) are
-  optional for boot; the orchestrator starts and connects to them lazily when a
-  request needs them. MongoDB, however, must be reachable at startup.
+## Build / run
 
-## Setup
-
-1. Copy the example environment file and fill in values:
-
-   ```bash
-   cp .env.example .env
-   ```
-
-2. Edit `.env`. At minimum set `API_KEY` to a value of your choosing (this key is
-   required on inbound API/WS requests and is sent to the Communicator as a Bearer
-   token). Every other variable defaults to a `localhost` service URL, so a single
-   machine running the companion services works out of the box. Each variable is
-   documented inline in `.env.example`.
-
-## Build
-
-No build/transpile step is required (plain ES modules). Install dependencies:
+Local dev:
 
 ```bash
-npm ci
+npm install
+cp .env.example .env   # edit before first run
+npm run dev            # node --watch, src/index.js
+npm start              # plain node
 ```
 
-`npm ci` also resolves the vendored SDK via the `file:./sdk` dependency in
-`package.json`.
+`run.sh` is the same (install + start). Listens on port 10001.
 
-## Run
+Docker:
 
 ```bash
-npm start        # node src/index.js
-# or
-npm run dev      # node --watch src/index.js (auto-restart)
-# or
-./run.sh         # install + start
+docker build -t orchestrator .
+docker run -p 10001:10001 --env-file .env orchestrator
 ```
 
-The server listens on `PORT` (default `10001`). Health check:
+The Dockerfile copies `sdk/` before `npm ci` because of the `file:./sdk`
+dependency, and installs `ffmpeg` for audio handling. Healthcheck hits
+`/api/v1/health`.
 
-```bash
-curl http://localhost:10001/api/v1/health
-```
+## Configuration
 
-### Docker
+Config is env vars. `.env.example` is the source of truth - copy to `.env` and
+edit. Key ones:
 
-```bash
-docker build -t ai-orchestrator .
-docker run --rm -p 10001:10001 --env-file .env ai-orchestrator
-```
+- `PORT`, `API_KEY` - bind + auth.
+- `MONGO_URL` - session/chat store.
+- The `*_URL` service endpoints it routes to: `COMMUNICATOR_URL`, `TTS_URL`,
+  `PIPER_TTS_URL`, `TRANSCRIBER_URL` / `TRANSCRIBER_WS_URL`, `ANTHROPIC_STT_URL`,
+  `TRANSLATOR_URL`, `REID_ANALYTICS_URL`.
+- `SESSION_TIMEOUT_MS`, `COMPACTION_THRESHOLD`, `CHAT_HISTORY_DIR` - session
+  behavior. See the example file for the rest.
 
-## Tests
+## Dependencies
 
-```bash
-node test/split-sentences.test.js
-node test/history-handoff.test.js
-node tests/rc-race.test.js     # needs a running orchestrator; honors ORCH_WS / ORCH_RC_WS / API_KEY
-```
-
-## Optional TLS / VPN
-
-By default the orchestrator and its agents communicate over plain HTTP/WebSocket
-(`http://`, `ws://`), so the project runs with no certificates and no VPN.
-
-- Agents (via `@orchestrator/sdk` `BaseAgent`) connect using the URL they are
-  configured with. To use TLS, point them at a `wss://` URL and set
-  `NODE_EXTRA_CA_CERTS` to a CA bundle file. If `NODE_EXTRA_CA_CERTS` is unset or
-  the file is missing, the agent falls back to a plain connection and does not
-  crash.
-- For remote-control callbacks, set `ORCHESTRATOR_PUBLIC_HOST` to the public
-  `host:port` (and front the orchestrator with a TLS-terminating proxy) so agents
-  dial back over `wss://`. If unset, the orchestrator uses the inbound request
-  Host header.
-
-Never commit certificate or key files (`*.pem`, `*.crt`, `*.key`, `*.p12`,
-`*.pfx`); they are gitignored.
-
-## The `@orchestrator/sdk` (`./sdk`)
-
-`sdk/` is the source of truth for the shared agent SDK: the WebSocket protocol,
-`BaseAgent` base class, tool-calling clients, the code-execution engine, and the
-device-tool definitions. `package.json` depends on it as `file:./sdk`, so a fresh
-clone is fully self-contained.
-
-Other repositories that need the SDK vendor a point-in-time copy of this `sdk/`
-folder (e.g. into their own `sdk/` or `vendor/orchestrator-sdk/`). To update a
-vendored copy, re-copy `sdk/` from this repository (group `jaskier-os`, repo
-`orchestrator`). Do not introduce a live git/registry dependency on it; keep
-consumers self-contained.
-
-## Model files
-
-This service does not ship trained model weights. Speech synthesis uses voice
-names (e.g. `am_echo`) resolved by the external TTS service, not bundled weights.
+Node >= 20, Koa 2, `mongodb`, `ws` for WebSocket, `multer` for uploads, `ffmpeg`
+(system package, in the image) for audio. `@orchestrator/sdk` is vendored in
+`./sdk` - it's not pulled from a registry; edit it in place and the orchestrator
+picks it up.
