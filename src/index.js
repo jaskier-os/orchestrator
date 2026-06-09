@@ -34,6 +34,7 @@ await copilotStore.init();
 
 await connectDb(config.mongoUrl);
 const todoStore = new TodoStore(getDb());
+await todoStore.seedIfEmpty();
 await todoStore.ensureOrder();
 
 const jobStore = new JobStore(getDb());

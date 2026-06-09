@@ -1,11 +1,67 @@
 import { ObjectId } from 'mongodb';
 
+// Default tasks written once on a fresh install so the list is never empty on
+// first run. Order matters: index 0 ends up at the top (order 0, newest createdAt).
+const SEED_TASKS = [
+  'finish glasses HUD review',
+  'reply to ana re: contract',
+  'reorder beans @ blue bottle',
+  'pay parking ticket',
+  'plan napa trip',
+  'gym 2x this week',
+  'read CRDT paper'
+];
+
 export class TodoStore {
   /**
    * @param {import('mongodb').Db} db
    */
   constructor(db) {
     this.collection = db.collection('todos');
+    this.metaCollection = db.collection('todos_meta');
+  }
+
+  /**
+   * Seed a default task set exactly once, the first time this store is ever used.
+   * Idempotent: a persisted "seeded" flag in todos_meta guarantees it never runs
+   * again, so if the user later deletes every task the list legitimately stays
+   * empty (we do not re-seed). No-op if any tasks already exist.
+   */
+  async seedIfEmpty() {
+    const meta = await this.metaCollection.findOne({ _id: 'seed' });
+    if (meta && meta.seeded) return;
+
+    const existing = await this.collection.countDocuments({});
+    if (existing > 0) {
+      // Pre-existing data: mark seeded so we never inject defaults over real tasks.
+      await this.metaCollection.updateOne(
+        { _id: 'seed' },
+        { $set: { seeded: true, seededAt: new Date(), reason: 'pre-existing' } },
+        { upsert: true }
+      );
+      return;
+    }
+
+    const base = Date.now();
+    // index 0 is top of the list: order 0 and the newest createdAt.
+    const docs = SEED_TASKS.map((text, i) => {
+      const createdAt = new Date(base + (SEED_TASKS.length - 1 - i));
+      return {
+        text,
+        completed: false,
+        priority: 'primary',
+        order: i,
+        createdAt,
+        updatedAt: createdAt
+      };
+    });
+    await this.collection.insertMany(docs);
+    await this.metaCollection.updateOne(
+      { _id: 'seed' },
+      { $set: { seeded: true, seededAt: new Date(), reason: 'fresh' } },
+      { upsert: true }
+    );
+    console.log(`[todo-store] Seeded ${docs.length} default tasks (first run)`);
   }
 
   /**

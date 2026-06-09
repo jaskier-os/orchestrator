@@ -15,13 +15,14 @@
 // Env vars:
 //   ORCH_WS    override device WS URL (default ws://localhost:10001/ws/device)
 //   ORCH_RC_WS override remote-control WS URL (default ws://localhost:10001/ws/remote-control)
-//   API_KEY    required (must match the orchestrator's API_KEY)
+//   API_KEY    required. Read from ../.env if not set.
 //
-// TLS: if you point ORCH_WS at a wss:// endpoint with a self-signed cert, set
-//   TLS_INSECURE=true to skip certificate verification for this test.
+// TLS: when ORCH_WS points at a wss:// endpoint with a self-signed cert, the
+//   connections below skip certificate verification (rejectUnauthorized: false).
 
 import WebSocket from 'ws';
 import crypto from 'crypto';
+import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -29,23 +30,20 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 function loadApiKey() {
   if (process.env.API_KEY) return process.env.API_KEY;
-  throw new Error('API_KEY env var is required to run this integration test');
+  const envPath = path.join(__dirname, '..', '.env');
+  const txt = fs.readFileSync(envPath, 'utf8');
+  const m = txt.match(/^API_KEY=(.+)$/m);
+  if (!m) throw new Error('API_KEY not found in .env');
+  return m[1].trim();
 }
 
 const API_KEY = loadApiKey();
 const ORCH_WS = process.env.ORCH_WS || 'ws://localhost:10001/ws/device';
 const ORCH_RC_WS = process.env.ORCH_RC_WS || 'ws://localhost:10001/ws/remote-control';
-const TLS_INSECURE = process.env.TLS_INSECURE === 'true';
-
-function wsOptions(extra = {}) {
-  const opts = { ...extra };
-  if (TLS_INSECURE) opts.rejectUnauthorized = false;
-  return opts;
-}
 
 function connectPhone() {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(ORCH_WS, wsOptions({ headers: { 'x-api-key': API_KEY } }));
+    const ws = new WebSocket(ORCH_WS, { headers: { 'x-api-key': API_KEY }, rejectUnauthorized: false });
     ws.once('open', () => {
       ws.send(JSON.stringify({
         type: 'identify',
@@ -61,7 +59,7 @@ function connectPhone() {
 function connectDesktop(sessionId) {
   const url = `${ORCH_RC_WS}?session=${sessionId}`;
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(url, wsOptions({ headers: { 'x-api-key': API_KEY } }));
+    const ws = new WebSocket(url, { headers: { 'x-api-key': API_KEY }, rejectUnauthorized: false });
     ws.once('open', () => resolve(ws));
     ws.once('error', reject);
   });
