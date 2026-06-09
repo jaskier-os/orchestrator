@@ -26,7 +26,7 @@ Single-in-flight: await each result before sending the next batch. Fresh
 
 | File            | Drives                                                                 |
 |-----------------|-----------------------------------------------------------------------|
-| `drive-live.mjs`| Baseline live driver -- identify/assistant_new/per-batch card flow. Defaults to the prod TLS ingress (`wss://65.108.225.44:8443/ws/device`). |
+| `drive-live.mjs`| Baseline live driver -- identify/assistant_new/per-batch card flow. Defaults to the local orchestrator (`ws://localhost:10001/ws/device`); override with `COPILOT_WS` to point at a remote ingress. |
 | `audit.mjs`     | Usefulness AUDIT: richer scenarios (sales/investor objections, negotiation, recall-with-planted-error, fraud escalation, small talk) to grade card usefulness. |
 | `stress.mjs`    | STRESS: four long worst-case scenarios, middle-skilled wearer vs hostile interlocutor. Writes `/tmp/copilot_stress.txt`. |
 | `ru.mjs`        | Russian-language scenarios -- validates every card comes back in the wearer's language (Russian). Writes `$COPILOT_OUT` (default `/tmp/copilot_ru.txt`). |

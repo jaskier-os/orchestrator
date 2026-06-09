@@ -17,7 +17,7 @@
 import WebSocket from 'ws';
 import crypto from 'crypto';
 
-const WS_URL = process.env.COPILOT_WS || 'wss://65.108.225.44:8443/ws/device';
+const WS_URL = process.env.COPILOT_WS || 'ws://localhost:10001/ws/device';
 const BATCH_TIMEOUT_MS = 30_000;
 const HUD_CAP = 5;
 const MODEL = 'haiku';
