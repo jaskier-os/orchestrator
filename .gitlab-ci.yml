@@ -5,9 +5,8 @@
 variables:
   REGISTRY: localhost:5000
   # SSH remote of the GitOps manifests repo whose image tags this pipeline bumps.
-  # Defaults to the CI server host; override DEPLOY_SSH_HOST / DEPLOY_SSH_PORT in
-  # the project's CI variables for a different host.
-  DEPLOY_REPO: ssh://git@${DEPLOY_SSH_HOST:-$CI_SERVER_HOST}:${DEPLOY_SSH_PORT:-41922}/infrastructure/deploy.git
+  # Same host as the CI server; the SSH git port is exposed on 41922.
+  DEPLOY_REPO: ssh://git@$CI_SERVER_HOST:41922/infrastructure/deploy.git
 
 stages:
   - build
@@ -54,7 +53,7 @@ build:
     DOCKERFILE: Dockerfile
     BUILD_CONTEXT: "."
   rules:
-    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_PIPELINE_SOURCE != "schedule" && $CI_COMMIT_BRANCH == "main"'
 
 deploy:
   extends: .deploy
@@ -62,7 +61,7 @@ deploy:
     SERVICE: orchestrator
   needs: [build]
   rules:
-    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_PIPELINE_SOURCE != "schedule" && $CI_COMMIT_BRANCH == "main"'
 
 # Two-way GitLab<->GitHub sync. GitLab is canonical and VPN-only, so sync is
 # GitLab-initiated:
@@ -73,6 +72,7 @@ deploy:
 sync-github:
   stage: sync
   tags: [shell]
+  needs: []
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_AUTHOR != "gitlab-github-sync <sync-bot@jaskier-os>"'
