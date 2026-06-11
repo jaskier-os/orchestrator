@@ -4,11 +4,15 @@
 
 variables:
   REGISTRY: localhost:5000
-  DEPLOY_REPO: ssh://git@10.29.71.1:41922/infrastructure/deploy.git
+  # SSH remote of the GitOps manifests repo whose image tags this pipeline bumps.
+  # Defaults to the CI server host; override DEPLOY_SSH_HOST / DEPLOY_SSH_PORT in
+  # the project's CI variables for a different host.
+  DEPLOY_REPO: ssh://git@${DEPLOY_SSH_HOST:-$CI_SERVER_HOST}:${DEPLOY_SSH_PORT:-41922}/infrastructure/deploy.git
 
 stages:
   - build
   - deploy
+  - sync
 
 .build-and-push:
   stage: build
@@ -59,3 +63,18 @@ deploy:
   needs: [build]
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
+
+# Two-way GitLab<->GitHub sync. GitLab is canonical and VPN-only, so sync is
+# GitLab-initiated:
+#   - push to main          -> immediate GitLab->GitHub propagation.
+#   - scheduled (every 10m) -> pulls GitHub-side changes (PR merges) back; cheap
+#                              ls-remote pre-check exits fast when already in sync.
+# Conflicts open a GitHub PR (see scripts/sync-gitlab-github.sh).
+sync-github:
+  stage: sync
+  tags: [shell]
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_AUTHOR != "gitlab-github-sync <sync-bot@jaskier-os>"'
+  script:
+    - bash scripts/sync-gitlab-github.sh

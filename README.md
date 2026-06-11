@@ -1,5 +1,7 @@
 # orchestrator
 
+> **Docs & wiki:** [github.com/jaskier-os/docs/wiki](https://github.com/jaskier-os/docs/wiki)
+
 ## What it is
 
 The central router. Client devices (phone, glasses, desktop) connect here and it

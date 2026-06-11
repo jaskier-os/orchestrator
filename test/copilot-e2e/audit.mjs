@@ -219,7 +219,10 @@ async function run() {
   log('[audit] done');
 
   const fs = await import('fs');
-  fs.writeFileSync('/media/varingait/Lobotomite/Repository/AI/orchestrator/copilot-audit-output.txt', out.join('\n'));
+  const path = await import('path');
+  const url = await import('url');
+  const outDir = path.dirname(url.fileURLToPath(import.meta.url));
+  fs.writeFileSync(path.join(outDir, 'copilot-audit-output.txt'), out.join('\n'));
 }
 
 run().catch(e => { console.error('[audit] fatal', e); process.exit(1); });

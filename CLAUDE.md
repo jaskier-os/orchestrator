@@ -103,7 +103,7 @@ service, and ship its Dockerfile. The orchestrator does not need to be redeploye
 # System architecture (all repos)
 
 This is the whole-system map. The codebase was split from a monorepo into separate standalone
-repos; component names below are the new repo names (GitLab group/repo on `10.29.71.1:4443`),
+repos; component names below are the new repo names (GitLab group/repo on the self-hosted GitLab),
 not old monorepo paths. Other repos can reference this section as "the orchestrator repo's
 system reference".
 
@@ -128,7 +128,7 @@ recognition) -> reid-db-handler (the only DB owner) -> reid-analytics (aggregati
 
 ## Repositories
 
-GitLab groups on `https://10.29.71.1:4443` (self-signed cert -> `-k` / `http.sslVerify=false`).
+GitLab groups on the self-hosted GitLab (self-signed cert -> `-k` / `http.sslVerify=false`).
 
 **`jaskier-os/` (AI orchestration)**
 - `jaskier-os/orchestrator` -- this repo. Central router/classifier/dispatcher; owns `@orchestrator/sdk`. Port 10001.
