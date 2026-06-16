@@ -48,6 +48,22 @@ All config is env vars; `.env.example` is the source of truth. Key ones:
 - `ORCHESTRATOR_PUBLIC_HOST` -- public host:port that remote agents (pc-agent) dial back for remote-control sessions; falls back to the inbound Host header if unset (set it in production to avoid host-header injection).
 - `NODE_EXTRA_CA_CERTS` -- optional CA bundle for `wss://`; if unset/missing the SDK BaseAgent stays on plain `ws://` and does not crash.
 
+### TTS routing (`TTS_ROUTING_MODE`)
+
+Controls how `src/tts.js` chooses a TTS engine. Joi-validated; invalid values fail fast at startup.
+
+- `language-split` (default) -- detects Cyrillic vs. Latin per segment and routes
+  English -> Kokoro (`TTS_URL`), Russian -> TeraTTS (`PIPER_TTS_URL`), mixed text
+  -> per-segment synthesis concatenated into one WAV.
+- `teratts` -- bypasses language detection; all text goes to TeraTTS
+  (`PIPER_TTS_URL`), which pronounces English words via Russian phonemes (English
+  g2p -> Russian phoneme symbols, no model retrain). Kokoro is left unused in this
+  mode.
+
+The flag is read at call time in `generateAudio`, `generateNotifAudio`, and
+`streamTts`. The Kokoro / language-split code path is retained; switching back to
+`language-split` restores it with no code change.
+
 ## Key files
 
 **`src/`**
