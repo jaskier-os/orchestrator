@@ -1214,8 +1214,32 @@ app.use(async (ctx) => {
         return;
       }
       try {
-        const transcript = await rcStore.getTranscript(sessionId);
-        ctx.body = { transcript };
+        let transcript = await rcStore.getTranscript(sessionId);
+        // Fallback for conversations started directly on the PC: they have no
+        // server-side transcript, so reconstruct it from the CLI's on-disk
+        // JSONL via pc-agent. Only when Mongo is empty -- phone-created sessions
+        // stay on the fast path and keep their phone-only entries (permission
+        // prompts) that the JSONL does not contain.
+        if (!transcript || transcript.length === 0) {
+          const workDir = existing.workDir;
+          const agentEntry = registry.getAgent('pc-agent');
+          if (workDir && agentEntry) {
+            try {
+              const response = await sendDirectAgentRequest(agentEntry, {
+                requestId: uuidv4(),
+                action: 'remote_session_export_transcript',
+                workDir,
+                sessionId
+              }, 60000);
+              if (response.status !== 'error' && Array.isArray(response.data?.transcript)) {
+                transcript = response.data.transcript;
+              }
+            } catch (e) {
+              console.error(`[gateway] RC transcript disk fallback ${sessionId} failed:`, e.message);
+            }
+          }
+        }
+        ctx.body = { transcript: transcript || [] };
       } catch (err) {
         console.error(`[gateway] RC get transcript ${sessionId} failed:`, err.message);
         ctx.status = 500;
