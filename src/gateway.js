@@ -805,7 +805,7 @@ app.use(async (ctx) => {
 
     // POST /api/v1/chats - create new conversation (optionally with first message)
     if (!conversationId && ctx.method === 'POST') {
-      const { text, image, deviceId, deviceType, userSystemPrompt } = ctx.request.body || {};
+      const { text, image, deviceId, deviceType, userSystemPrompt, requestId: clientRequestId } = ctx.request.body || {};
 
       const effectiveDeviceId = deviceId || 'rest-client';
       const effectiveDeviceType = deviceType || 'phone';
@@ -827,7 +827,9 @@ app.use(async (ctx) => {
         return;
       }
 
-      const requestId = uuidv4();
+      // Prefer a client-supplied idempotency key so a transport-level resend
+      // reuses the same requestId; the dispatcher/store collapse the duplicate.
+      const requestId = clientRequestId || uuidv4();
       console.log(`[gateway] New chat ${requestId} -> conversation ${session.conversationId} from ${effectiveDeviceId}`);
 
       try {
@@ -883,7 +885,7 @@ app.use(async (ctx) => {
 
     // POST /api/v1/chats/:id/message - send message to resume conversation
     if (conversationId && isMessageRoute && ctx.method === 'POST') {
-      const { text, image, deviceId, deviceType, userSystemPrompt } = ctx.request.body || {};
+      const { text, image, deviceId, deviceType, userSystemPrompt, requestId: clientRequestId } = ctx.request.body || {};
 
       if (!text && !image) {
         ctx.status = 400;
@@ -910,8 +912,9 @@ app.use(async (ctx) => {
         effectiveDeviceId, effectiveDeviceType, conversationId, conversation.turns || []
       );
 
-      // Send the new message through the normal pipeline
-      const requestId = uuidv4();
+      // Send the new message through the normal pipeline. Prefer a
+      // client-supplied idempotency key (see createChat) so a resend collapses.
+      const requestId = clientRequestId || uuidv4();
       console.log(`[gateway] Chat resume ${requestId} for conversation ${conversationId} from ${effectiveDeviceId}`);
 
       try {

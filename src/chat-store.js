@@ -26,6 +26,15 @@ export class ChatStore {
     this.indexPath = path.join(dataDir, 'index.json');
     this.saveTimer = null;
     this.saveDebounceMs = 5000;
+    /**
+     * Idempotency guard for beginTurn: "<conversationId>:<requestId>" keys that
+     * already have a pending turn written this process. A transport-level resend
+     * reuses its requestId, so the second beginTurn is skipped (no duplicate
+     * user turn, no double turnCount). Pruned in completeTurn. Transient by
+     * design: the resend window is milliseconds, far shorter than process life.
+     * @type {Set<string>}
+     */
+    this.begunRequests = new Set();
   }
 
   /**
@@ -105,30 +114,51 @@ export class ChatStore {
   }
 
   /**
-   * Append a turn to an existing conversation.
+   * Resolve a conversation's index entry, auto-creating the conversation if it
+   * does not exist yet (and device metadata is available). Returns null if the
+   * conversation cannot be resolved or created.
+   * @param {string} conversationId
+   * @param {object} [metadata]
+   * @returns {Promise<object|null>}
+   */
+  async _resolveEntry(conversationId, metadata) {
+    let entry = this.index.get(conversationId);
+    if (!entry && metadata?.deviceId) {
+      console.log(`[chat-store] Auto-creating conversation ${conversationId} for device ${metadata.deviceId}`);
+      await this.createConversation({ id: conversationId, deviceId: metadata.deviceId, deviceType: metadata.deviceType || 'unknown' });
+      entry = this.index.get(conversationId);
+    }
+    return entry || null;
+  }
+
+  /**
+   * Persist the user half of a turn immediately, before the AI has responded.
+   * Writes a pending turn line (response: null) keyed by requestId so a client
+   * that reopens the conversation mid-flight still sees its own prompt. The
+   * matching response is appended later by completeTurn() and merged on read.
    * @param {string} conversationId
    * @param {object} turn
    * @param {string} turn.requestId
    * @param {string} [turn.userText]
    * @param {string} [turn.userImage] - base64 image or null
-   * @param {object} [turn.classification]
-   * @param {object} turn.response
-   * @param {object} [turn.usage]
+   * @param {object} [metadata]
    * @returns {Promise<void>}
    */
-  async appendTurn(conversationId, turn, metadata) {
-    let entry = this.index.get(conversationId);
+  async beginTurn(conversationId, turn, metadata) {
+    const entry = await this._resolveEntry(conversationId, metadata);
     if (!entry) {
-      if (metadata?.deviceId) {
-        console.log(`[chat-store] Auto-creating conversation ${conversationId} for device ${metadata.deviceId}`);
-        await this.createConversation({ id: conversationId, deviceId: metadata.deviceId, deviceType: metadata.deviceType || 'unknown' });
-        entry = this.index.get(conversationId);
-      }
-      if (!entry) {
-        console.error(`[chat-store] Cannot append turn: conversation ${conversationId} not found`);
-        return;
-      }
+      console.error(`[chat-store] Cannot begin turn: conversation ${conversationId} not found`);
+      return;
     }
+
+    // Idempotency: skip a duplicate begin for the same requestId (transport
+    // resend). The first begin already wrote the pending turn + bumped the count.
+    const guardKey = turn.requestId ? `${conversationId}:${turn.requestId}` : null;
+    if (guardKey && this.begunRequests.has(guardKey)) {
+      console.log(`[chat-store] Skipping duplicate beginTurn for ${guardKey}`);
+      return;
+    }
+    if (guardKey) this.begunRequests.add(guardKey);
 
     const now = new Date().toISOString();
     const line = {
@@ -137,6 +167,46 @@ export class ChatStore {
       requestId: turn.requestId,
       userText: turn.userText || null,
       userImage: turn.userImage || null,
+      classification: null,
+      response: null,
+      usage: null,
+      toolCalls: null
+    };
+
+    const fullPath = path.join(this.dataDir, entry.path);
+    await fs.appendFile(fullPath, JSON.stringify(line) + '\n');
+
+    this._recordTurnInIndex(entry, now, { firstUserMessage: turn.userText });
+  }
+
+  /**
+   * Persist the response half of a turn once the AI has finished. Appends a
+   * turn_response line keyed by the same requestId as the earlier beginTurn();
+   * getConversationTurns()/rebuildIndex() fold it into the pending turn. Does
+   * NOT bump turnCount (beginTurn already did). If no prior beginTurn was
+   * written (legacy / direct callers), the merge still emits a standalone turn.
+   * @param {string} conversationId
+   * @param {object} turn
+   * @param {string} turn.requestId
+   * @param {object} [turn.classification]
+   * @param {object} turn.response
+   * @param {object} [turn.usage]
+   * @param {Array} [turn.toolCalls]
+   * @param {object} [metadata]
+   * @returns {Promise<void>}
+   */
+  async completeTurn(conversationId, turn, metadata) {
+    const entry = await this._resolveEntry(conversationId, metadata);
+    if (!entry) {
+      console.error(`[chat-store] Cannot complete turn: conversation ${conversationId} not found`);
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const line = {
+      type: 'turn_response',
+      ts: now,
+      requestId: turn.requestId,
       classification: turn.classification || null,
       response: turn.response || null,
       usage: turn.usage || null,
@@ -146,17 +216,22 @@ export class ChatStore {
     const fullPath = path.join(this.dataDir, entry.path);
     await fs.appendFile(fullPath, JSON.stringify(line) + '\n');
 
-    this._recordTurnInIndex(entry, now, {
-      firstUserMessage: turn.userText,
-      agentId: turn.response?.agentId
-    });
+    // Response only advances activity + agent tracking; the turn was already
+    // counted by beginTurn so turnCount must not increase here.
+    entry.lastActivityAt = now;
+    const agentId = turn.response?.agentId;
+    if (agentId && !entry.agents.includes(agentId)) {
+      entry.agents.push(agentId);
+    }
+    if (turn.requestId) this.begunRequests.delete(`${conversationId}:${turn.requestId}`);
+    this.scheduleSave();
   }
 
   /**
    * Append a raw, caller-shaped turn line to an existing conversation without
    * imposing the normal-chat turn schema. Used by feature stores (e.g. copilot)
    * that persist their own turn fields. Index bookkeeping is shared with
-   * appendTurn via _recordTurnInIndex so there is no duplication.
+   * beginTurn via _recordTurnInIndex so there is no duplication.
    * @param {string} conversationId
    * @param {object} turnObj - arbitrary turn fields (merged after {type:'turn'})
    * @returns {Promise<void>}
@@ -187,7 +262,7 @@ export class ChatStore {
   /**
    * Shared index bookkeeping for any appended turn: bump turnCount, advance
    * lastActivityAt, capture the first user-facing line, and track agents. Keeps
-   * appendTurn and appendRawTurn from duplicating the index update logic.
+   * beginTurn and appendRawTurn from duplicating the index update logic.
    * @param {object} entry - index entry to mutate
    * @param {string} now - ISO timestamp of the turn
    * @param {object} [meta]
@@ -323,11 +398,18 @@ export class ChatStore {
         for (let i = 1; i < lines.length; i++) {
           const line = JSON.parse(lines[i]);
           if (line.type === 'turn') {
+            // turnCount tracks user turns; the paired turn_response (if any) is
+            // counted via its turn line, never on its own.
             entry.turnCount++;
             entry.lastActivityAt = line.ts;
             if (!entry.firstUserMessage && line.userText) {
               entry.firstUserMessage = line.userText.substring(0, 200);
             }
+            if (line.response?.agentId && !entry.agents.includes(line.response.agentId)) {
+              entry.agents.push(line.response.agentId);
+            }
+          } else if (line.type === 'turn_response') {
+            entry.lastActivityAt = line.ts;
             if (line.response?.agentId && !entry.agents.includes(line.response.agentId)) {
               entry.agents.push(line.response.agentId);
             }
@@ -382,7 +464,7 @@ export class ChatStore {
       const events = lines.map(line => JSON.parse(line));
 
       const header = events.find(e => e.type === 'header');
-      const turns = events.filter(e => e.type === 'turn');
+      const turns = mergeTurnEvents(events);
       const close = events.find(e => e.type === 'close');
 
       return {
@@ -440,7 +522,9 @@ export class ChatStore {
         const lines = content.trim().split('\n').filter(Boolean);
         for (const line of lines) {
           const parsed = JSON.parse(line);
-          if (parsed.type !== 'turn') continue;
+          // userText lives on `turn` lines; response.text may live on either a
+          // legacy `turn` line or a two-phase `turn_response` line.
+          if (parsed.type !== 'turn' && parsed.type !== 'turn_response') continue;
           const userMatch = parsed.userText && parsed.userText.toLowerCase().includes(q);
           const respMatch = parsed.response?.text && parsed.response.text.toLowerCase().includes(q);
           if (userMatch || respMatch) {
@@ -523,4 +607,75 @@ export class ChatStore {
     const d = String(date.getDate()).padStart(2, '0');
     return `${y}/${m}/${d}`;
   }
+}
+
+/**
+ * Fold a conversation's raw NDJSON events into client-facing turns. A turn is
+ * persisted in two phases: a `turn` line (user half, written at request start)
+ * and a later `turn_response` line (AI half) sharing the same requestId. This
+ * merges them into one object preserving file order, so a turn whose response
+ * has not arrived yet surfaces with response: null (a pending turn the client
+ * renders as "thinking"). A `turn_response` with no preceding `turn` (legacy or
+ * direct completeTurn callers) becomes a standalone turn.
+ * @param {object[]} events - parsed NDJSON lines in file order
+ * @returns {object[]} merged turns in original order
+ */
+export function mergeTurnEvents(events) {
+  const turns = [];
+  const byRequestId = new Map();
+
+  for (const e of events) {
+    if (e.type === 'turn') {
+      // Collapse a duplicate pending turn for the same requestId (a transport
+      // resend that slipped past the in-process begin guard, e.g. across a
+      // restart). The existing pending turn is the merge target; drop the dup.
+      if (e.requestId && byRequestId.has(e.requestId)) {
+        continue;
+      }
+      const turn = {
+        type: 'turn',
+        ts: e.ts,
+        requestId: e.requestId,
+        userText: e.userText ?? null,
+        userImage: e.userImage ?? null,
+        classification: e.classification ?? null,
+        response: e.response ?? null,
+        usage: e.usage ?? null,
+        toolCalls: e.toolCalls ?? null
+      };
+      turns.push(turn);
+      // Only index pending turns (no response yet) as merge targets. A turn
+      // already carrying a response is a completed legacy turn; a later stray
+      // turn_response with the same id must not overwrite it.
+      if (turn.response == null && turn.requestId) {
+        byRequestId.set(turn.requestId, turn);
+      }
+    } else if (e.type === 'turn_response') {
+      const pending = e.requestId ? byRequestId.get(e.requestId) : null;
+      if (pending) {
+        pending.ts = e.ts ?? pending.ts;
+        pending.classification = e.classification ?? null;
+        pending.response = e.response ?? null;
+        pending.usage = e.usage ?? null;
+        pending.toolCalls = e.toolCalls ?? null;
+        byRequestId.delete(e.requestId);
+      } else {
+        // Orphan response (no matching pending turn): surface standalone so the
+        // AI text is never silently dropped.
+        turns.push({
+          type: 'turn',
+          ts: e.ts,
+          requestId: e.requestId,
+          userText: null,
+          userImage: null,
+          classification: e.classification ?? null,
+          response: e.response ?? null,
+          usage: e.usage ?? null,
+          toolCalls: e.toolCalls ?? null
+        });
+      }
+    }
+  }
+
+  return turns;
 }

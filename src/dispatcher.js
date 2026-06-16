@@ -177,10 +177,15 @@ async function _handleRequestInner(request, deviceWs) {
   const userContent = buildUserContent(text, imageBase64);
   session.addUserMessage(userContent);
 
+  // Persist the user half of this turn immediately so a client that reopens the
+  // conversation before the AI answers still sees its own prompt. The response
+  // half is appended by completeTurn() once a final status is reached.
+  beginTurn(session, { requestId, userText: text, userImage: imageBase64 });
+
   // Classify intent
   const manifests = registry.getManifests();
   if (manifests.length === 0) {
-    persistTurn(session, { requestId, userText: text, userImage: imageBase64, classification: null, response: { status: 'error', text: 'No agents are currently available.', agentId: null } });
+    completeTurn(session, { requestId, classification: null, response: { status: 'error', text: 'No agents are currently available.', agentId: null } });
     return { text: 'No agents are currently available.', status: 'error' };
   }
 
@@ -195,7 +200,7 @@ async function _handleRequestInner(request, deviceWs) {
       if (attempt < MAX_CLASSIFY_RETRIES) {
         await new Promise(r => setTimeout(r, 2000 * attempt));
       } else {
-        persistTurn(session, { requestId, userText: text, userImage: imageBase64, classification: null, response: { status: 'error', text: 'Failed to classify request.', agentId: null } });
+        completeTurn(session, { requestId, classification: null, response: { status: 'error', text: 'Failed to classify request.', agentId: null } });
         return { text: 'Failed to classify request.', status: 'error' };
       }
     }
@@ -342,7 +347,7 @@ async function _handleRequestInner(request, deviceWs) {
 
     sessionManager.updateUsage(session, llmResult.usage);
     const formatted = format({ text: llmResult.text, status: 'success' }, deviceType);
-    persistTurn(session, { requestId, userText: text, userImage: imageBase64, classification, response: { status: 'success', text: formatted.text, agentId: 'direct-llm' }, usage, toolCalls: collectedToolCalls.length > 0 ? collectedToolCalls : undefined });
+    completeTurn(session, { requestId, classification, response: { status: 'success', text: formatted.text, agentId: 'direct-llm' }, usage, toolCalls: collectedToolCalls.length > 0 ? collectedToolCalls : undefined });
     return { ...formatted, status: 'success', usage };
   }
 
@@ -351,7 +356,7 @@ async function _handleRequestInner(request, deviceWs) {
   // Route to agent
   const agentEntry = registry.getAgent(classification.agentId);
   if (!agentEntry) {
-    persistTurn(session, { requestId, userText: text, userImage: imageBase64, classification, response: { status: 'error', text: `Agent "${classification.agentId}" is not available.`, agentId: classification.agentId } });
+    completeTurn(session, { requestId, classification, response: { status: 'error', text: `Agent "${classification.agentId}" is not available.`, agentId: classification.agentId } });
     return { text: `Agent "${classification.agentId}" is not available.`, status: 'error' };
   }
 
@@ -382,13 +387,14 @@ async function _handleRequestInner(request, deviceWs) {
       }
       const formatted = format(response, deviceType);
       const agentToolCalls = buildAgentToolCalls(allCollectedToolCalls);
-      persistTurn(session, { requestId, userText: text, userImage: imageBase64, classification, response: { status: response.status, text: formatted.text, agentId: classification.agentId }, usage, toolCalls: agentToolCalls.length > 0 ? agentToolCalls : undefined });
+      completeTurn(session, { requestId, classification, response: { status: response.status, text: formatted.text, agentId: classification.agentId }, usage, toolCalls: agentToolCalls.length > 0 ? agentToolCalls : undefined });
       return { ...formatted, status: response.status, usage };
     }
 
     if (response.status === AGENT_RESPONSE_STATUS.NEEDS_INPUT) {
       if (!deviceWs || deviceWs.readyState !== 1) {
         if (fwd) fwd.stop();
+        completeTurn(session, { requestId, classification, response: { status: 'error', text: 'Agent needs device input but no device connection available.', agentId: classification.agentId }, usage });
         return { text: 'Agent needs device input but no device connection available.', status: 'error' };
       }
 
@@ -401,6 +407,7 @@ async function _handleRequestInner(request, deviceWs) {
       } catch (err) {
         console.error(`[dispatcher] Device command failed for request ${requestId}:`, err.message);
         if (fwd) fwd.stop();
+        completeTurn(session, { requestId, classification, response: { status: 'error', text: `Device command failed: ${err.message}`, agentId: classification.agentId }, usage });
         return { text: `Device command failed: ${err.message}`, status: 'error' };
       }
 
@@ -451,7 +458,8 @@ async function _handleRequestInner(request, deviceWs) {
 
         if (!delegateEntry) {
           if (fwd) fwd.stop();
-          return { text: `Delegation target agent is not available.`, status: 'error' };
+          completeTurn(session, { requestId, classification, response: { status: 'error', text: 'Delegation target agent is not available.', agentId: classification.agentId }, usage });
+          return { text: 'Delegation target agent is not available.', status: 'error' };
         }
       }
 
@@ -489,7 +497,7 @@ async function _handleRequestInner(request, deviceWs) {
     if (fwd) fwd.stop();
     console.error(`[dispatcher] Unknown response status: ${response.status}`);
     const agentToolCalls = buildAgentToolCalls(allCollectedToolCalls);
-    persistTurn(session, { requestId, userText: text, userImage: imageBase64, classification, response: { status: 'error', text: 'Received unknown response from agent.', agentId: classification.agentId }, usage, toolCalls: agentToolCalls.length > 0 ? agentToolCalls : undefined });
+    completeTurn(session, { requestId, classification, response: { status: 'error', text: 'Received unknown response from agent.', agentId: classification.agentId }, usage, toolCalls: agentToolCalls.length > 0 ? agentToolCalls : undefined });
     return { text: 'Received unknown response from agent.', status: 'error' };
   }
 }
@@ -513,15 +521,31 @@ function buildAgentToolCalls(collected) {
 }
 
 /**
- * Persist a turn to the chat store (fire-and-forget).
+ * Persist the user half of a turn immediately, before classification/agent work
+ * begins, so a client that reopens the conversation mid-flight still sees its
+ * own prompt (rendered as a pending "thinking" turn). Fire-and-forget.
+ * @param {import('./session.js').Session} session
+ * @param {{ requestId: string, userText?: string, userImage?: string }} turnData
+ */
+function beginTurn(session, turnData) {
+  if (!chatStore) return;
+  const meta = { deviceId: session.deviceId, deviceType: session.deviceType };
+  chatStore.beginTurn(session.conversationId, turnData, meta).catch(err => {
+    console.error(`[dispatcher] Failed to begin turn:`, err.message);
+  });
+}
+
+/**
+ * Persist the response half of a turn once the AI has finished. Merged with the
+ * earlier beginTurn() line by requestId on read. Fire-and-forget.
  * @param {import('./session.js').Session} session
  * @param {object} turnData
  */
-function persistTurn(session, turnData) {
+function completeTurn(session, turnData) {
   if (!chatStore) return;
   const meta = { deviceId: session.deviceId, deviceType: session.deviceType };
-  chatStore.appendTurn(session.conversationId, turnData, meta).catch(err => {
-    console.error(`[dispatcher] Failed to persist turn:`, err.message);
+  chatStore.completeTurn(session.conversationId, turnData, meta).catch(err => {
+    console.error(`[dispatcher] Failed to complete turn:`, err.message);
   });
 }
 
