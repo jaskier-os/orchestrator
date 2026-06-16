@@ -660,7 +660,7 @@ export function streamTts(requestId, text, getDeviceWs) {
           }
           const b64 = audioBuffer.toString('base64');
           const audioHeader = audioBuffer.subarray(0, 4).toString('ascii');
-          console.log(`[tts] Sending RU audio: sentence ${i+1}/${sentences.length}, format=${audioHeader === 'OggS' ? 'Opus' : 'WAV'}, rawBytes=${audioBuffer.length}, base64Len=${b64.length}, text="${sentences[i].substring(0, 40)}"`);
+          console.log(`[tts] Sending TTS audio: sentence ${i+1}/${sentences.length}, format=${audioHeader === 'OggS' ? 'Opus' : 'WAV'}, rawBytes=${audioBuffer.length}, base64Len=${b64.length}, text="${sentences[i].substring(0, 40)}"`);
 
           const wsAfter = getDeviceWs();
           if (abortRef.aborted || !wsAfter || wsAfter.readyState !== 1) return;
