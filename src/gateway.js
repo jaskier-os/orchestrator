@@ -169,11 +169,58 @@ app.use(async (ctx) => {
     return;
   }
 
-  if (ctx.path === '/api/v1/remote-sessions/start' && ctx.method === 'POST') {
-    const { workDir, deviceId, permissionMode: rawPermissionMode } = ctx.request.body || {};
+  if (ctx.path === '/api/v1/remote-sessions/conversations' && ctx.method === 'GET') {
+    const workDir = ctx.query.workDir;
     if (!workDir) {
       ctx.status = 400;
       ctx.body = { error: { message: 'Missing workDir', status: 400 } };
+      return;
+    }
+    const agentEntry = registry.getAgent('pc-agent');
+    if (!agentEntry) {
+      ctx.status = 503;
+      ctx.body = { error: { message: 'PC agent not available', status: 503 } };
+      return;
+    }
+    const limit = ctx.query.limit != null ? parseInt(ctx.query.limit, 10) : undefined;
+    const offset = ctx.query.offset != null ? parseInt(ctx.query.offset, 10) : undefined;
+    try {
+      const response = await sendDirectAgentRequest(agentEntry, {
+        requestId: uuidv4(),
+        action: 'remote_session_list_conversations',
+        workDir,
+        limit,
+        offset
+      }, 60000);
+      if (response.status === 'error') {
+        ctx.status = 500;
+        ctx.body = { error: { message: response.text, status: 500 } };
+        return;
+      }
+      ctx.body = { sessions: response.data?.sessions || [] };
+    } catch (err) {
+      console.error('[gateway] Remote session list conversations failed:', err.message);
+      ctx.status = 500;
+      ctx.body = { error: { message: err.message, status: 500 } };
+    }
+    return;
+  }
+
+  if (ctx.path === '/api/v1/remote-sessions/start' && ctx.method === 'POST') {
+    const { workDir, deviceId, permissionMode: rawPermissionMode, sessionId: requestedSessionId } = ctx.request.body || {};
+    if (!workDir) {
+      ctx.status = 400;
+      ctx.body = { error: { message: 'Missing workDir', status: 400 } };
+      return;
+    }
+    // Resuming a prior conversation: the client passes its sessionId, which IS
+    // the Claude Code conversation id. pc-agent's hasExistingTranscript then
+    // spawns with --resume so the model reloads context. Validate it is a UUID
+    // to avoid path traversal into arbitrary transcript files.
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (requestedSessionId != null && !UUID_RE.test(requestedSessionId)) {
+      ctx.status = 400;
+      ctx.body = { error: { message: 'invalid sessionId', status: 400 } };
       return;
     }
     const orchestratorMode = (rawPermissionMode == null || rawPermissionMode === '')
@@ -191,8 +238,10 @@ app.use(async (ctx) => {
       return;
     }
     try {
-      // Create RC session in store before telling pc-agent to spawn
-      const sessionId = crypto.randomUUID();
+      // Create RC session in store before telling pc-agent to spawn. When
+      // resuming, reuse the requested id (rcStore.create is an upsert that
+      // preserves the existing transcript/pendingQueue); otherwise mint a new one.
+      const sessionId = requestedSessionId || crypto.randomUUID();
       await rcStore.create(sessionId, workDir, orchestratorMode);
 
       // Bind session to requesting phone device
