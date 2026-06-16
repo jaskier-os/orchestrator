@@ -1216,11 +1216,19 @@ app.use(async (ctx) => {
       try {
         let transcript = await rcStore.getTranscript(sessionId);
         // Fallback for conversations started directly on the PC: they have no
-        // server-side transcript, so reconstruct it from the CLI's on-disk
-        // JSONL via pc-agent. Only when Mongo is empty -- phone-created sessions
-        // stay on the fast path and keep their phone-only entries (permission
-        // prompts) that the JSONL does not contain.
-        if (!transcript || transcript.length === 0) {
+        // server-side message history, so reconstruct it from the CLI's on-disk
+        // JSONL via pc-agent. Trigger when Mongo has no RENDERABLE content --
+        // bookkeeping-only transcripts (e.g. a lone rc_session_end from a prior
+        // resume) still count as empty. Phone-created sessions have real
+        // message entries and stay on the fast path, keeping their phone-only
+        // entries (permission prompts) that the JSONL does not contain.
+        const RENDERABLE_TYPES = new Set([
+          'user_message', 'rc_message', 'rc_tool_status',
+          'rc_permission_request', 'rc_permission_resolved', 'text', 'tool'
+        ]);
+        const hasRenderable = Array.isArray(transcript)
+          && transcript.some(e => RENDERABLE_TYPES.has(e?.type));
+        if (!hasRenderable) {
           const workDir = existing.workDir;
           const agentEntry = registry.getAgent('pc-agent');
           if (workDir && agentEntry) {
