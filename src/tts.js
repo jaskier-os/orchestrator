@@ -338,6 +338,7 @@ function wrapPcmInWav(pcmBuffer, sampleRate = 24000, channels = 1, bitDepth = 16
  */
 export async function generateNotifAudio(text) {
   text = stripUrlsToDomain(text);
+  if (config.ttsRoutingMode === 'teratts') return generateAudioPiperOpus(text);
   const segments = segmentByLanguage(text);
   const allEnglish = segments.length === 0 || segments.every(s => s.lang === 'en');
 
@@ -363,6 +364,7 @@ export async function generateNotifAudio(text) {
  * @returns {Promise<Buffer>}
  */
 export async function generateAudio(text) {
+  if (config.ttsRoutingMode === 'teratts') return generateAudioPiper(text);
   const segments = segmentByLanguage(text);
   if (segments.length === 0) {
     return generateAudioKokoro(text);
@@ -637,18 +639,25 @@ export function streamTts(requestId, text, getDeviceWs) {
         return;
       }
 
-      const isEnglish = segmentByLanguage(sentences[i]).every(s => s.lang === 'en');
+      const useTeratts = config.ttsRoutingMode === 'teratts';
+      const isEnglish = !useTeratts && segmentByLanguage(sentences[i]).every(s => s.lang === 'en');
 
       try {
         if (isEnglish) {
           await streamKokoroChunks(sentences[i], i, sentences.length, requestId, getDeviceWs, abortRef);
         } else {
           // Use Opus for non-English to keep BT payload small (~20x smaller than WAV)
-          const segments = segmentByLanguage(sentences[i]);
-          const allRussian = segments.every(s => s.lang === 'ru');
-          const audioBuffer = allRussian
-            ? await generateAudioPiperOpus(sentences[i])
-            : await wavToOpus(await generateAudio(sentences[i]));
+          let audioBuffer;
+          if (useTeratts) {
+            // teratts mode: TeraTTS pronounces everything (including English) via Russian phonemes
+            audioBuffer = await generateAudioPiperOpus(sentences[i]);
+          } else {
+            const segments = segmentByLanguage(sentences[i]);
+            const allRussian = segments.every(s => s.lang === 'ru');
+            audioBuffer = allRussian
+              ? await generateAudioPiperOpus(sentences[i])
+              : await wavToOpus(await generateAudio(sentences[i]));
+          }
           const b64 = audioBuffer.toString('base64');
           const audioHeader = audioBuffer.subarray(0, 4).toString('ascii');
           console.log(`[tts] Sending RU audio: sentence ${i+1}/${sentences.length}, format=${audioHeader === 'OggS' ? 'Opus' : 'WAV'}, rawBytes=${audioBuffer.length}, base64Len=${b64.length}, text="${sentences[i].substring(0, 40)}"`);
