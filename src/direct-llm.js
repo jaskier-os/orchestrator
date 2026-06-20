@@ -40,7 +40,8 @@ export async function directLLM(messages, model, tools, globalInstructions) {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${config.apiKey}`
     },
-    body: JSON.stringify(body)
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(120_000)
   });
 
   if (!response.ok) {

@@ -149,9 +149,16 @@ export class PTCClient {
         return { text: text || 'No response generated.', rounds: round + 1, toolCallCount: totalToolCalls };
       }
 
-      const code = typeof codeCall.function.arguments === 'string'
-        ? JSON.parse(codeCall.function.arguments).code
-        : codeCall.function.arguments.code;
+      let parsedArgs;
+      try {
+        parsedArgs = typeof codeCall.function.arguments === 'string'
+          ? JSON.parse(codeCall.function.arguments)
+          : codeCall.function.arguments;
+      } catch {
+        console.error(`[PTC] Failed to parse execute_code arguments, skipping round`);
+        return { text: 'Failed to parse code arguments from LLM response.', rounds: round + 1, toolCallCount: totalToolCalls };
+      }
+      const code = parsedArgs.code;
 
       console.log(`[PTC] Round ${round + 1}: executing code (${code.length} chars)`);
 
@@ -284,7 +291,8 @@ export class PTCClient {
         tool_choice: 'auto',
         max_tokens: maxTokens,
         stream: false
-      })
+      }),
+      signal: AbortSignal.timeout(120_000)
     });
 
     if (!response.ok) {
@@ -332,15 +340,13 @@ export class PTCClient {
 
     let toolCalls = message.tool_calls || null;
     if (toolCalls) {
-      toolCalls = toolCalls.map(tc => ({
-        ...tc,
-        function: {
-          ...tc.function,
-          arguments: typeof tc.function.arguments === 'string'
-            ? JSON.parse(tc.function.arguments)
-            : tc.function.arguments
+      toolCalls = toolCalls.map(tc => {
+        let args = tc.function.arguments;
+        if (typeof args === 'string') {
+          try { args = JSON.parse(args); } catch { args = {}; }
         }
-      }));
+        return { ...tc, function: { ...tc.function, arguments: args } };
+      });
     }
 
     return {

@@ -111,12 +111,15 @@ function forwardToolStatus(agentWs, deviceWs, matchRequestId, overrideRequestId)
           collected.push({ toolCallId: envelope.toolCallId, toolName: envelope.toolName, toolArgs: envelope.toolArgs, status: 'calling', toolResult: null });
         }
 
-        if (overrideRequestId) {
-          envelope.requestId = overrideRequestId;
-          deviceWs.send(serializeMessage(envelope));
-        } else {
-          deviceWs.send(raw.toString());
-        }
+        if (deviceWs.readyState !== 1) return;
+        try {
+          if (overrideRequestId) {
+            envelope.requestId = overrideRequestId;
+            deviceWs.send(serializeMessage(envelope));
+          } else {
+            deviceWs.send(raw.toString());
+          }
+        } catch {}
       }
     } catch {}
   }
@@ -182,6 +185,7 @@ async function _handleRequestInner(request, deviceWs) {
   // half is appended by completeTurn() once a final status is reached.
   beginTurn(session, { requestId, userText: text, userImage: imageBase64 });
 
+  try {
   // Classify intent
   const manifests = registry.getManifests();
   if (manifests.length === 0) {
@@ -220,7 +224,13 @@ async function _handleRequestInner(request, deviceWs) {
     usage = sumUsage(usage, llmResult.usage);
 
     // Device tool call loop -- process ALL tool calls per assistant message before calling LLM again
+    const MAX_TOOL_ROUNDS = 15;
+    let toolRound = 0;
     while (llmResult.toolCalls && llmResult.toolCalls.length > 0 && deviceWs && deviceWs.readyState === 1) {
+      if (++toolRound > MAX_TOOL_ROUNDS) {
+        console.error(`[dispatcher] Direct LLM tool loop exceeded ${MAX_TOOL_ROUNDS} rounds for request ${requestId}`);
+        break;
+      }
       // Fix null content on assistant messages with tool_calls (Communicator rejects null)
       const assistantMsg = { ...llmResult.assistantMessage, content: llmResult.assistantMessage.content || '' };
       messages.push(assistantMsg);
@@ -379,7 +389,17 @@ async function _handleRequestInner(request, deviceWs) {
   let response = await sendToAgentAndWait(agentEntry, agentRequest);
   if (fwd) { fwd.stop(); allCollectedToolCalls.push(...fwd.collected); }
 
+  const MAX_SESSION_ROUNDS = 10;
+  let sessionRound = 0;
   while (true) {
+    if (++sessionRound > MAX_SESSION_ROUNDS) {
+      console.error(`[dispatcher] Session loop exceeded ${MAX_SESSION_ROUNDS} rounds for request ${requestId}`);
+      if (fwd) fwd.stop();
+      const cappedToolCalls = buildAgentToolCalls(allCollectedToolCalls);
+      completeTurn(session, { requestId, classification, response: { status: 'error', text: 'Request exceeded maximum processing rounds.', agentId: classification.agentId }, usage, toolCalls: cappedToolCalls.length > 0 ? cappedToolCalls : undefined });
+      return { text: 'Request exceeded maximum processing rounds.', status: 'error' };
+    }
+
     if (response.status === AGENT_RESPONSE_STATUS.SUCCESS || response.status === AGENT_RESPONSE_STATUS.ERROR || response.status === AGENT_RESPONSE_STATUS.PARTIAL) {
       if (fwd) fwd.stop();
       if (response.status === AGENT_RESPONSE_STATUS.SUCCESS || response.status === AGENT_RESPONSE_STATUS.PARTIAL) {
@@ -500,6 +520,12 @@ async function _handleRequestInner(request, deviceWs) {
     completeTurn(session, { requestId, classification, response: { status: 'error', text: 'Received unknown response from agent.', agentId: classification.agentId }, usage, toolCalls: agentToolCalls.length > 0 ? agentToolCalls : undefined });
     return { text: 'Received unknown response from agent.', status: 'error' };
   }
+
+  } catch (err) {
+    console.error(`[dispatcher] Unhandled error in request ${requestId}:`, err.message);
+    completeTurn(session, { requestId, classification: null, response: { status: 'error', text: `Internal error: ${err.message}`, agentId: null } });
+    return { text: `Internal error: ${err.message}`, status: 'error' };
+  }
 }
 
 /**
@@ -561,10 +587,27 @@ function sendToAgentAndWait(agentEntry, agentRequest, timeoutMs = DEFAULT_TIMEOU
     const { ws } = agentEntry;
     const { requestId } = agentRequest;
 
-    const timeout = setTimeout(() => {
+    const cleanup = () => {
+      clearTimeout(timeout);
       ws.removeListener('message', handler);
+      ws.removeListener('close', onClose);
+      ws.removeListener('error', onError);
+    };
+
+    const timeout = setTimeout(() => {
+      cleanup();
       reject(new Error(`Agent response timeout after ${timeoutMs}ms for request ${requestId}`));
     }, timeoutMs);
+
+    function onClose(code) {
+      cleanup();
+      reject(new Error(`Agent WebSocket closed (code=${code}) while waiting for response to request ${requestId}`));
+    }
+
+    function onError(err) {
+      cleanup();
+      reject(new Error(`Agent WebSocket error while waiting for request ${requestId}: ${err.message}`));
+    }
 
     function handler(raw) {
       let envelope;
@@ -575,16 +618,21 @@ function sendToAgentAndWait(agentEntry, agentRequest, timeoutMs = DEFAULT_TIMEOU
       }
 
       if (envelope.type === MSG_TYPE.RESPONSE && envelope.payload?.requestId === requestId) {
-        clearTimeout(timeout);
-        ws.removeListener('message', handler);
+        cleanup();
         resolve(envelope.payload);
       }
     }
 
     ws.on('message', handler);
+    ws.on('close', onClose);
+    ws.on('error', onError);
 
-    const msg = createRequestMessage(agentRequest);
-    ws.send(serializeMessage(msg));
+    try {
+      ws.send(serializeMessage(createRequestMessage(agentRequest)));
+    } catch (err) {
+      cleanup();
+      reject(new Error(`Failed to send request to agent: ${err.message}`));
+    }
   });
 }
 
@@ -599,10 +647,28 @@ function sendToAgentAndWait(agentEntry, agentRequest, timeoutMs = DEFAULT_TIMEOU
 function sendDeviceCommandAndWait(deviceWs, requestId, command, timeoutMs = DEFAULT_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const effectiveTimeout = command.timeout || timeoutMs;
-    const timeout = setTimeout(() => {
+
+    const cleanup = () => {
+      clearTimeout(timeout);
       deviceWs.removeListener('message', handler);
+      deviceWs.removeListener('close', onClose);
+      deviceWs.removeListener('error', onError);
+    };
+
+    const timeout = setTimeout(() => {
+      cleanup();
       reject(new Error(`Device response timeout after ${effectiveTimeout}ms for request ${requestId}`));
     }, effectiveTimeout);
+
+    function onClose(code) {
+      cleanup();
+      reject(new Error(`Device WebSocket closed (code=${code}) while waiting for response to request ${requestId}`));
+    }
+
+    function onError(err) {
+      cleanup();
+      reject(new Error(`Device WebSocket error while waiting for request ${requestId}: ${err.message}`));
+    }
 
     function handler(raw) {
       let envelope;
@@ -613,16 +679,21 @@ function sendDeviceCommandAndWait(deviceWs, requestId, command, timeoutMs = DEFA
       }
 
       if (envelope.type === MSG_TYPE.DEVICE_RESPONSE && envelope.payload?.requestId === requestId) {
-        clearTimeout(timeout);
-        deviceWs.removeListener('message', handler);
+        cleanup();
         resolve(envelope.payload);
       }
     }
 
     deviceWs.on('message', handler);
+    deviceWs.on('close', onClose);
+    deviceWs.on('error', onError);
 
-    const msg = createDeviceCommandMessage(requestId, command);
-    deviceWs.send(serializeMessage(msg));
+    try {
+      deviceWs.send(serializeMessage(createDeviceCommandMessage(requestId, command)));
+    } catch (err) {
+      cleanup();
+      reject(new Error(`Failed to send command to device: ${err.message}`));
+    }
   });
 }
 
@@ -729,7 +800,8 @@ async function handleJobTool(toolName, toolArgs, deviceWs) {
 function pushJobUpdate(deviceWs) {
   if (!deviceWs || deviceWs.readyState !== 1 || !jobStore) return;
   jobStore.list().then(jobs => {
-    deviceWs.send(serializeMessage({ type: MSG_TYPE.JOB_RESULT, action: 'list', jobs }));
+    if (deviceWs.readyState !== 1) return;
+    try { deviceWs.send(serializeMessage({ type: MSG_TYPE.JOB_RESULT, action: 'list', jobs })); } catch {}
   }).catch(err => {
     console.error('[dispatcher] Failed to push job update:', err.message);
   });
@@ -742,7 +814,8 @@ function pushJobUpdate(deviceWs) {
 function pushTodoUpdate(deviceWs) {
   if (!deviceWs || deviceWs.readyState !== 1 || !todoStore) return;
   todoStore.list().then(todos => {
-    deviceWs.send(serializeMessage({ type: MSG_TYPE.TODO_RESULT, action: 'list', todos }));
+    if (deviceWs.readyState !== 1) return;
+    try { deviceWs.send(serializeMessage({ type: MSG_TYPE.TODO_RESULT, action: 'list', todos })); } catch {}
   }).catch(err => {
     console.error('[dispatcher] Failed to push todo update:', err.message);
   });

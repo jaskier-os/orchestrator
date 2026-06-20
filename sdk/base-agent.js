@@ -163,8 +163,15 @@ export class BaseAgent {
   async onMessage(envelope) {
     switch (envelope.type) {
       case MSG_TYPE.REQUEST: {
+        const HANDLE_TIMEOUT_MS = 300_000; // 5 minutes
         try {
-          const result = await this.handle(envelope.payload);
+          const handlePromise = this.handle(envelope.payload);
+          let timeoutId;
+          const timeoutPromise = new Promise((_, reject) => {
+            timeoutId = setTimeout(() => reject(new Error(`handle() timed out after ${HANDLE_TIMEOUT_MS}ms`)), HANDLE_TIMEOUT_MS);
+          });
+          const result = await Promise.race([handlePromise, timeoutPromise]);
+          clearTimeout(timeoutId);
           const response = createResponseMessage(result);
           this.send(response);
         } catch (err) {
@@ -196,6 +203,8 @@ export class BaseAgent {
   send(envelope) {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(serializeMessage(envelope));
+    } else {
+      console.warn(`[${this.manifest.id}] Dropped message (ws not open): type=${envelope.type}`);
     }
   }
 
@@ -300,12 +309,14 @@ export class BaseAgent {
     process.on('SIGINT', shutdown);
     process.on('SIGTERM', shutdown);
 
-    // Prevent crashes from killing the agent -- log and keep running
+    // Log and exit on uncaught exceptions -- let the container supervisor restart us
+    // rather than running in a potentially corrupted state
     process.on('uncaughtException', (err) => {
-      console.error(`[${this.manifest.id}] Uncaught exception (keeping alive):`, err.message);
+      console.error(`[${this.manifest.id}] Uncaught exception -- exiting for restart:`, err.message, err.stack);
+      process.exit(1);
     });
     process.on('unhandledRejection', (reason) => {
-      console.error(`[${this.manifest.id}] Unhandled rejection (keeping alive):`, reason);
+      console.error(`[${this.manifest.id}] Unhandled rejection:`, reason);
     });
   }
 

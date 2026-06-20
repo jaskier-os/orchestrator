@@ -746,40 +746,49 @@ app.use(async (ctx) => {
 
     // GET /api/v1/copilot-chats - list copilot sessions as summaries
     if (!conversationId && ctx.method === 'GET') {
-      const limit = parseInt(ctx.query.limit) || 50;
-      const offset = parseInt(ctx.query.offset) || 0;
-      const { conversations, total } = copilotStore.listConversations({ limit, offset });
-      ctx.body = {
-        conversations: conversations.map(c => ({
-          id: c.id,
-          startedAt: c.startedAt,
-          lastActivityAt: c.lastActivityAt,
-          turnCount: c.turnCount,
-          // Title from the first turn's interlocutorText (stored as
-          // firstUserMessage on the index at appendRawTurn time; falls back to
-          // wearerText there), else the startedAt date string. No fabrication.
-          title: c.firstUserMessage || c.startedAt
-        })),
-        total,
-        offset,
-        limit
-      };
+      try {
+        const limit = parseInt(ctx.query.limit) || 50;
+        const offset = parseInt(ctx.query.offset) || 0;
+        const { conversations, total } = copilotStore.listConversations({ limit, offset });
+        ctx.body = {
+          conversations: conversations.map(c => ({
+            id: c.id,
+            startedAt: c.startedAt,
+            lastActivityAt: c.lastActivityAt,
+            turnCount: c.turnCount,
+            title: c.firstUserMessage || c.startedAt
+          })),
+          total,
+          offset,
+          limit
+        };
+      } catch (err) {
+        console.error('[gateway] Copilot list conversations failed:', err.message);
+        ctx.status = 500;
+        ctx.body = { error: { message: 'Internal server error', status: 500 } };
+      }
       return;
     }
 
     // GET /api/v1/copilot-chats/:id - full session detail
     if (conversationId && ctx.method === 'GET') {
-      const conversation = await copilotStore.getConversationTurns(conversationId);
-      if (!conversation) {
-        ctx.status = 404;
-        ctx.body = { error: { message: 'Copilot conversation not found', status: 404 } };
-        return;
+      try {
+        const conversation = await copilotStore.getConversationTurns(conversationId);
+        if (!conversation) {
+          ctx.status = 404;
+          ctx.body = { error: { message: 'Copilot conversation not found', status: 404 } };
+          return;
+        }
+        ctx.body = {
+          header: conversation.header,
+          turns: conversation.turns,
+          close: conversation.close
+        };
+      } catch (err) {
+        console.error('[gateway] Copilot get conversation failed:', err.message);
+        ctx.status = 500;
+        ctx.body = { error: { message: 'Internal server error', status: 500 } };
       }
-      ctx.body = {
-        header: conversation.header,
-        turns: conversation.turns,
-        close: conversation.close
-      };
       return;
     }
   }
@@ -792,13 +801,19 @@ app.use(async (ctx) => {
 
     // GET /api/v1/chats - list or search conversations
     if (!conversationId && ctx.method === 'GET') {
-      const limit = parseInt(ctx.query.limit) || 50;
-      const offset = parseInt(ctx.query.offset) || 0;
-      const search = ctx.query.search;
-      if (search) {
-        ctx.body = await chatStore.searchConversations(search, { limit, offset });
-      } else {
-        ctx.body = chatStore.listConversations({ limit, offset });
+      try {
+        const limit = parseInt(ctx.query.limit) || 50;
+        const offset = parseInt(ctx.query.offset) || 0;
+        const search = ctx.query.search;
+        if (search) {
+          ctx.body = await chatStore.searchConversations(search, { limit, offset });
+        } else {
+          ctx.body = chatStore.listConversations({ limit, offset });
+        }
+      } catch (err) {
+        console.error('[gateway] Chat list/search failed:', err.message);
+        ctx.status = 500;
+        ctx.body = { error: { message: 'Internal server error', status: 500 } };
       }
       return;
     }
@@ -854,32 +869,44 @@ app.use(async (ctx) => {
 
     // GET /api/v1/chats/:id - get conversation detail
     if (conversationId && !isMessageRoute && ctx.method === 'GET') {
-      const conversation = await chatStore.getConversationTurns(conversationId);
-      if (!conversation) {
-        ctx.status = 404;
-        ctx.body = { error: { message: 'Conversation not found', status: 404 } };
-        return;
+      try {
+        const conversation = await chatStore.getConversationTurns(conversationId);
+        if (!conversation) {
+          ctx.status = 404;
+          ctx.body = { error: { message: 'Conversation not found', status: 404 } };
+          return;
+        }
+        ctx.body = conversation;
+      } catch (err) {
+        console.error('[gateway] Chat get conversation failed:', err.message);
+        ctx.status = 500;
+        ctx.body = { error: { message: 'Internal server error', status: 500 } };
       }
-      ctx.body = conversation;
       return;
     }
 
     // DELETE /api/v1/chats/:id - delete conversation
     if (conversationId && !isMessageRoute && ctx.method === 'DELETE') {
-      // Close any active session holding this conversation
-      for (const [deviceId, session] of sessionManager.sessions) {
-        if (session.conversationId === conversationId) {
-          sessionManager.removeSession(deviceId);
-          break;
+      try {
+        // Close any active session holding this conversation
+        for (const [deviceId, session] of sessionManager.sessions) {
+          if (session.conversationId === conversationId) {
+            sessionManager.removeSession(deviceId);
+            break;
+          }
         }
+        const deleted = await chatStore.deleteConversation(conversationId);
+        if (!deleted) {
+          ctx.status = 404;
+          ctx.body = { error: { message: 'Conversation not found', status: 404 } };
+          return;
+        }
+        ctx.body = { status: 'ok' };
+      } catch (err) {
+        console.error('[gateway] Chat delete conversation failed:', err.message);
+        ctx.status = 500;
+        ctx.body = { error: { message: 'Internal server error', status: 500 } };
       }
-      const deleted = await chatStore.deleteConversation(conversationId);
-      if (!deleted) {
-        ctx.status = 404;
-        ctx.body = { error: { message: 'Conversation not found', status: 404 } };
-        return;
-      }
-      ctx.body = { status: 'ok' };
       return;
     }
 
@@ -897,7 +924,15 @@ app.use(async (ctx) => {
       const effectiveDeviceType = deviceType || 'phone';
 
       // Load conversation turns for session resume
-      const conversation = await chatStore.getConversationTurns(conversationId);
+      let conversation;
+      try {
+        conversation = await chatStore.getConversationTurns(conversationId);
+      } catch (err) {
+        console.error('[gateway] Chat resume getConversationTurns failed:', err.message);
+        ctx.status = 500;
+        ctx.body = { error: { message: 'Internal server error', status: 500 } };
+        return;
+      }
       if (!conversation) {
         ctx.status = 404;
         ctx.body = { error: { message: 'Conversation not found', status: 404 } };
@@ -905,12 +940,26 @@ app.use(async (ctx) => {
       }
 
       // Reopen if closed
-      chatStore.reopenConversation(conversationId);
+      try {
+        chatStore.reopenConversation(conversationId);
+      } catch (err) {
+        console.error('[gateway] Chat reopenConversation failed:', err.message);
+        ctx.status = 500;
+        ctx.body = { error: { message: 'Internal server error', status: 500 } };
+        return;
+      }
 
       // Create/resume session from history
-      await sessionManager.createSessionFromHistory(
-        effectiveDeviceId, effectiveDeviceType, conversationId, conversation.turns || []
-      );
+      try {
+        await sessionManager.createSessionFromHistory(
+          effectiveDeviceId, effectiveDeviceType, conversationId, conversation.turns || []
+        );
+      } catch (err) {
+        console.error('[gateway] Chat createSessionFromHistory failed:', err.message);
+        ctx.status = 500;
+        ctx.body = { error: { message: 'Internal server error', status: 500 } };
+        return;
+      }
 
       // Send the new message through the normal pipeline. Prefer a
       // client-supplied idempotency key (see createChat) so a resend collapses.
@@ -983,6 +1032,7 @@ app.use(async (ctx) => {
           'Authorization': `Bearer ${config.apiKey}`,
         },
         body: form.getBuffer(),
+        signal: AbortSignal.timeout(30_000),
       });
     } catch (err) {
       console.error(`[gateway] ReID multipart proxy failed:`, err.message);
@@ -1054,7 +1104,7 @@ app.use(async (ctx) => {
 
     let response;
     try {
-      response = await fetch(targetUrl, fetchOpts);
+      response = await fetch(targetUrl, { ...fetchOpts, signal: AbortSignal.timeout(30_000) });
     } catch (err) {
       console.error(`[gateway] ReID proxy failed:`, err.message);
       ctx.status = 502;
@@ -1107,7 +1157,7 @@ app.use(async (ctx) => {
 
     let response;
     try {
-      response = await fetch(targetUrl, { method: 'GET' });
+      response = await fetch(targetUrl, { method: 'GET', signal: AbortSignal.timeout(15_000) });
     } catch (err) {
       console.error(`[gateway] Tiles proxy failed:`, err.message);
       ctx.status = 502;
@@ -1398,6 +1448,7 @@ async function handleTranscribe(ctx) {
         'Authorization': `Bearer ${config.apiKey}`,
       },
       body: form.getBuffer(),
+      signal: AbortSignal.timeout(60_000),
     });
   } catch (err) {
     console.error(`[gateway] Transcriber request failed:`, err.message);
@@ -1406,7 +1457,15 @@ async function handleTranscribe(ctx) {
     return;
   }
 
-  const data = await response.json();
+  let data;
+  try {
+    data = await response.json();
+  } catch {
+    const text = await response.text().catch(() => '');
+    ctx.status = response.status || 502;
+    ctx.body = { error: { message: text || 'Transcriber returned non-JSON response', status: ctx.status } };
+    return;
+  }
 
   if (!response.ok) {
     ctx.status = response.status;
@@ -1446,6 +1505,7 @@ async function handleTranslate(ctx) {
         'Authorization': `Bearer ${config.apiKey}`,
       },
       body: JSON.stringify({ text, source_lang, target_lang }),
+      signal: AbortSignal.timeout(30_000),
     });
   } catch (err) {
     console.error(`[gateway] Translator request failed:`, err.message);
@@ -1454,7 +1514,15 @@ async function handleTranslate(ctx) {
     return;
   }
 
-  const data = await response.json();
+  let data;
+  try {
+    data = await response.json();
+  } catch {
+    const text = await response.text().catch(() => '');
+    ctx.status = response.status || 502;
+    ctx.body = { error: { message: text || 'Translator returned non-JSON response', status: ctx.status } };
+    return;
+  }
 
   if (!response.ok) {
     ctx.status = response.status;
@@ -1476,12 +1544,30 @@ async function handleTranslate(ctx) {
 export function sendDirectAgentRequest(agentEntry, payload, timeoutMs = 60000) {
   return new Promise((resolve, reject) => {
     const { requestId } = payload;
+    const { ws } = agentEntry;
     const msg = createRequestMessage(payload);
 
+    const cleanup = () => {
+      clearTimeout(timeout);
+      ws.removeListener('message', onMessage);
+      ws.removeListener('close', onClose);
+      ws.removeListener('error', onError);
+    };
+
     const timeout = setTimeout(() => {
-      agentEntry.ws.removeListener('message', onMessage);
-      reject(new Error('Agent request timed out'));
+      cleanup();
+      reject(new Error(`Agent request timed out after ${timeoutMs}ms for request ${requestId}`));
     }, timeoutMs);
+
+    function onClose(code) {
+      cleanup();
+      reject(new Error(`Agent WebSocket closed (code=${code}) while waiting for response to request ${requestId}`));
+    }
+
+    function onError(err) {
+      cleanup();
+      reject(new Error(`Agent WebSocket error while waiting for request ${requestId}: ${err.message}`));
+    }
 
     function onMessage(raw) {
       let envelope;
@@ -1491,14 +1577,21 @@ export function sendDirectAgentRequest(agentEntry, payload, timeoutMs = 60000) {
         return;
       }
       if (envelope.type === MSG_TYPE.RESPONSE && envelope.payload?.requestId === requestId) {
-        clearTimeout(timeout);
-        agentEntry.ws.removeListener('message', onMessage);
+        cleanup();
         resolve(envelope.payload);
       }
     }
 
-    agentEntry.ws.on('message', onMessage);
-    agentEntry.ws.send(serializeMessage(msg));
+    ws.on('message', onMessage);
+    ws.on('close', onClose);
+    ws.on('error', onError);
+
+    try {
+      ws.send(serializeMessage(msg));
+    } catch (err) {
+      cleanup();
+      reject(new Error(`Failed to send to agent WebSocket: ${err.message}`));
+    }
   });
 }
 

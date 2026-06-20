@@ -280,7 +280,8 @@ export class SessionManager {
               { role: 'user', content: compactionPrompt }
             ],
             stream: false
-          })
+          }),
+          signal: AbortSignal.timeout(60_000)
         });
 
         if (response.ok) {
@@ -370,7 +371,8 @@ RULES:
           model: this.llmModel,
           messages: compactionMessages,
           stream: false
-        })
+        }),
+        signal: AbortSignal.timeout(60_000)
       });
 
       if (!response.ok) {

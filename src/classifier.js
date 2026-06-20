@@ -80,7 +80,8 @@ export async function classify(text, manifests, sessionHistory) {
         messages: msgs,
         stream: false,
         max_tokens: 200
-      })
+      }),
+      signal: AbortSignal.timeout(30_000)
     });
 
     if (!response.ok) {
