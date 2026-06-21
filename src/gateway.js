@@ -1,3 +1,6 @@
+import fs from 'fs';
+import { pipeline } from 'stream/promises';
+import { Transform } from 'stream';
 import Koa from 'koa';
 import bodyParser from 'koa-bodyparser';
 import multer from '@koa/multer';
@@ -58,9 +61,34 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 
 
 const MULTIPART_PATHS = ['/api/v1/transcribe', '/api/v1/reid/persons/search/photo'];
 
-// Conditionally apply bodyParser (skip for multipart routes)
+// --- Sideload file staging ---
+const SIDELOAD_MAX_SIZE = 512 * 1024 * 1024; // 512MB
+const SIDELOAD_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const SIDELOAD_MAX_STAGED = 5;
+const SIDELOAD_SWEEP_INTERVAL_MS = 60_000;
+
+/** @type {Map<string, {id: string, path: string, size: number, sha256: string, createdAt: number}>} */
+const stagedFiles = new Map();
+
+// TTL sweeper: delete staged files older than 10 minutes
+const sideloadSweepInterval = setInterval(() => {
+  const now = Date.now();
+  for (const [id, meta] of stagedFiles) {
+    if (now - meta.createdAt > SIDELOAD_TTL_MS) {
+      console.log(`[sideload] TTL expired for staged file ${id}, deleting`);
+      fs.unlink(meta.path, () => {});
+      stagedFiles.delete(id);
+    }
+  }
+}, SIDELOAD_SWEEP_INTERVAL_MS);
+sideloadSweepInterval.unref();
+
+/** Paths that bypass both bodyParser AND multer (raw stream handling). */
+const RAW_STREAM_PATHS = ['/api/v1/sideload/stage'];
+
+// Conditionally apply bodyParser (skip for multipart and raw-stream routes)
 app.use(async (ctx, next) => {
-  if (MULTIPART_PATHS.includes(ctx.path)) {
+  if (MULTIPART_PATHS.includes(ctx.path) || RAW_STREAM_PATHS.includes(ctx.path)) {
     return await next();
   }
   return bodyParser({ jsonLimit: '5mb' })(ctx, next);
@@ -154,6 +182,78 @@ app.use(async (ctx) => {
       ctx.status = 500;
       ctx.body = { error: { message: 'Internal server error', status: 500 } };
     }
+    return;
+  }
+
+  // --- Sideload staging routes ---
+  if (ctx.path === '/api/v1/sideload/stage' && ctx.method === 'POST') {
+    // Enforce concurrent staged file cap
+    if (stagedFiles.size >= SIDELOAD_MAX_STAGED) {
+      ctx.status = 503;
+      ctx.body = { ok: false, error: 'too_many_staged', message: `Maximum ${SIDELOAD_MAX_STAGED} concurrent staged files reached` };
+      return;
+    }
+
+    const id = uuidv4();
+    const filePath = `/tmp/sideload-${id}`;
+    const hash = crypto.createHash('sha256');
+    let bytesWritten = 0;
+
+    const writeStream = fs.createWriteStream(filePath);
+    const hashTransform = new Transform({
+      transform(chunk, encoding, callback) {
+        hash.update(chunk);
+        bytesWritten += chunk.length;
+        if (bytesWritten > SIDELOAD_MAX_SIZE) {
+          callback(new Error('File exceeds maximum size of 512MB'));
+          return;
+        }
+        callback(null, chunk);
+      }
+    });
+
+    try {
+      await pipeline(ctx.req, hashTransform, writeStream);
+      const sha256 = hash.digest('hex');
+      const meta = { id, path: filePath, size: bytesWritten, sha256, createdAt: Date.now() };
+      stagedFiles.set(id, meta);
+      console.log(`[sideload] Staged file ${id}: ${bytesWritten} bytes, sha256=${sha256.substring(0, 16)}...`);
+      ctx.body = { ok: true, id, size: bytesWritten, sha256 };
+    } catch (err) {
+      // Clean up partial file on error
+      fs.unlink(filePath, () => {});
+      console.error(`[sideload] Stage failed for ${id}:`, err.message);
+      ctx.status = 500;
+      ctx.body = { ok: false, error: 'stage_failed', message: err.message };
+    }
+    return;
+  }
+
+  const stagedMatch = ctx.path.match(/^\/api\/v1\/sideload\/staged\/([^/]+)$/);
+  if (stagedMatch && ctx.method === 'GET') {
+    const id = stagedMatch[1];
+    const meta = stagedFiles.get(id);
+    if (!meta) {
+      ctx.status = 404;
+      ctx.body = { ok: false, error: 'not_found' };
+      return;
+    }
+
+    ctx.set('Content-Type', 'application/octet-stream');
+    ctx.set('Content-Length', String(meta.size));
+    ctx.body = fs.createReadStream(meta.path);
+
+    // One-shot: delete file and metadata after response completes
+    const cleanup = () => {
+      fs.unlink(meta.path, () => {});
+      stagedFiles.delete(id);
+      console.log(`[sideload] Served and deleted staged file ${id}`);
+    };
+    ctx.res.on('finish', cleanup);
+    ctx.res.on('close', () => {
+      // If response was aborted before finish, still clean up
+      if (stagedFiles.has(id)) cleanup();
+    });
     return;
   }
 

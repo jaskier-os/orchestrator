@@ -211,6 +211,12 @@ const activeTtsStreams = new Map();
 // Aborted request IDs: skip TTS for these
 const abortedRequests = new Set();
 
+// Pending sideload commands: requestId -> { originWs, timer }
+// Maps sideload device_command requestIds to the WS that originated them,
+// so responses from the phone can be relayed back to the correct caller.
+const pendingSideloadCommands = new Map();
+const SIDELOAD_COMMAND_TIMEOUT_MS = 300_000; // 5 minutes
+
 // Telegram new message subscriber: the device WS that wants real-time push
 let telegramSubscriberWs = null;
 
@@ -1216,6 +1222,96 @@ function handleDeviceConnection(ws, request) {
       return;
     }
 
+    // --- Sideload command relay: any WS client -> phone device ---
+    if (envelope.type === 'sideload_command') {
+      const { requestId: sideloadReqId, commandType, payload: sideloadPayload } = envelope;
+      if (!sideloadReqId || !commandType) {
+        safeSend({ type: 'sideload_response', requestId: sideloadReqId || null, error: 'missing_fields', message: 'requestId and commandType are required' });
+        return;
+      }
+
+      // Find the phone device WS
+      let phoneWs = null;
+      for (const [, dws] of deviceConnections) {
+        if (dws._deviceType === 'phone' && dws.readyState === 1) {
+          phoneWs = dws;
+          break;
+        }
+      }
+      if (!phoneWs) {
+        safeSend({ type: 'sideload_response', requestId: sideloadReqId, error: 'phone_not_connected', message: 'Phone device is not connected' });
+        return;
+      }
+
+      // For sideload_upload, inject the download URL so the phone can fetch the staged file
+      let command = { type: commandType, ...sideloadPayload };
+      if (commandType === 'sideload_upload' && command.fileId) {
+        const publicHost = process.env.ORCHESTRATOR_PUBLIC_HOST || null;
+        if (!publicHost) {
+          safeSend(ws, JSON.stringify({
+            type: 'sideload_response',
+            requestId: sideloadReqId,
+            error: 'ORCHESTRATOR_PUBLIC_HOST is not configured; cannot construct download URL for the phone'
+          }));
+          return;
+        }
+        command.downloadUrl = `https://${publicHost}/api/v1/sideload/staged/${command.fileId}`;
+      }
+
+      // Store pending entry for response correlation
+      const timer = setTimeout(() => {
+        const pending = pendingSideloadCommands.get(sideloadReqId);
+        if (pending) {
+          pendingSideloadCommands.delete(sideloadReqId);
+          console.error(`[sideload] Command ${commandType} timed out after ${SIDELOAD_COMMAND_TIMEOUT_MS}ms (requestId=${sideloadReqId})`);
+          if (pending.originWs.readyState === 1) {
+            pending.originWs.send(serializeMessage({
+              type: 'sideload_response',
+              requestId: sideloadReqId,
+              error: 'timeout',
+              message: `Sideload command ${commandType} timed out`
+            }));
+          }
+        }
+      }, SIDELOAD_COMMAND_TIMEOUT_MS);
+
+      pendingSideloadCommands.set(sideloadReqId, { originWs: ws, timer });
+
+      // Relay as DEVICE_COMMAND to the phone
+      try {
+        phoneWs.send(serializeMessage({
+          type: MSG_TYPE.DEVICE_COMMAND,
+          requestId: sideloadReqId,
+          command
+        }));
+        console.log(`[sideload] Relayed ${commandType} to phone (requestId=${sideloadReqId})`);
+      } catch (err) {
+        clearTimeout(timer);
+        pendingSideloadCommands.delete(sideloadReqId);
+        console.error(`[sideload] Failed to relay ${commandType} to phone:`, err.message);
+        safeSend({ type: 'sideload_response', requestId: sideloadReqId, error: 'relay_failed', message: err.message });
+      }
+      return;
+    }
+
+    // Intercept DEVICE_RESPONSE from phone for pending sideload commands
+    if (envelope.type === MSG_TYPE.DEVICE_RESPONSE && envelope.payload?.requestId) {
+      const pending = pendingSideloadCommands.get(envelope.payload.requestId);
+      if (pending) {
+        clearTimeout(pending.timer);
+        pendingSideloadCommands.delete(envelope.payload.requestId);
+        console.log(`[sideload] Relaying response for requestId=${envelope.payload.requestId} back to origin`);
+        if (pending.originWs.readyState === 1) {
+          pending.originWs.send(serializeMessage({
+            type: 'sideload_response',
+            requestId: envelope.payload.requestId,
+            payload: envelope.payload
+          }));
+        }
+        return;
+      }
+    }
+
     // Device responses (to device commands) are handled by the dispatcher's listener
   });
 
@@ -1245,6 +1341,30 @@ function handleDeviceConnection(ws, request) {
             sendDirectAgentRequest(agentEntry, { requestId, action: 'telegram_unsubscribe' }).catch(() => {});
           }
         } catch {}
+      }
+
+      // Clean up pending sideload commands where this WS is the origin or the phone
+      for (const [reqId, pending] of pendingSideloadCommands) {
+        if (pending.originWs === ws) {
+          clearTimeout(pending.timer);
+          pendingSideloadCommands.delete(reqId);
+          console.log(`[sideload] Cleaned up pending command ${reqId} (origin disconnected)`);
+        }
+      }
+      // If the phone disconnected, notify all pending sideload origins
+      if (ws._deviceType === 'phone') {
+        for (const [reqId, pending] of pendingSideloadCommands) {
+          clearTimeout(pending.timer);
+          pendingSideloadCommands.delete(reqId);
+          if (pending.originWs.readyState === 1) {
+            pending.originWs.send(serializeMessage({
+              type: 'sideload_response',
+              requestId: reqId,
+              error: 'phone_disconnected',
+              message: 'Phone disconnected during sideload operation'
+            }));
+          }
+        }
       }
 
       // Clean up stream sessions involving this device (collect IDs first to avoid mutating Map during iteration)
