@@ -640,6 +640,7 @@ export async function handleRemoteControlConnection(ws, request) {
     }
     existing.thinkingStartedAt = null;
     existing.desktopWs = ws;
+    existing.lastAssistantText = '';
     if (preloadedTitleSet) existing.titleSet = true;
     // Reconnect to existing in-memory session: the CLI will replay, so
     // enable the replay buffer to protect phone messages from being dropped.
@@ -684,7 +685,12 @@ export async function handleRemoteControlConnection(ws, request) {
       // 'result' event (marks end of replay) or a safety timeout.
       replayInProgress: preloadedTitleSet, // has history -> will replay
       replayPhoneBuffer: preloadedTitleSet ? [] : null,
-      replayFlushTimer: null
+      replayFlushTimer: null,
+      // Accumulated assistant text for the current turn. Persisted as a
+      // single transcript entry on 'result' instead of once per streaming
+      // partial, so $slice:-1000 stops silently dropping older conversation
+      // history in long / multi-device sessions.
+      lastAssistantText: ''
     };
     rcSessions.set(sessionId, session);
     desktopToSession.set(ws, sessionId);
@@ -1107,6 +1113,10 @@ function processDesktopMessage(sessionId, session, parsed) {
     }
     if (textParts.length > 0) {
       const text = textParts.join('');
+      // Claude Code's stream-json text events are cumulative snapshots (each
+      // carries the full response so far), so track the latest as the turn's
+      // final text. Persisted once on 'result' rather than per-partial.
+      session.lastAssistantText = text;
       // Fallback titling: Claude Code's stream-json does NOT echo back the
       // user's PC-terminal input as a `type:'user'` text block, so the
       // RC_USER_MESSAGE / desktop-user-text paths above never fire for
@@ -1120,7 +1130,10 @@ function processDesktopMessage(sessionId, session, parsed) {
       }
       const partialMsg = createRcMessage(sessionId, text, false);
       if (session.contextPct > 0) partialMsg.contextPct = session.contextPct;
-      sendToPhone(sessionId, partialMsg, shouldPersist);
+      // Streaming partials are live-only (never persisted): one entry per
+      // stream token would blow past the transcript $slice cap and drop
+      // earlier turns. The consolidated final text is persisted on 'result'.
+      sendToPhone(sessionId, partialMsg, false);
     }
     return;
   }
@@ -1202,10 +1215,29 @@ function processDesktopMessage(sessionId, session, parsed) {
     // End the thinking turn before sending the final message so the phone
     // can clear the indicator and stamp "Thought for Xs" on the bubble.
     emitThinkingEnd(sessionId, session);
+    // Persist the turn's full assistant text as a SINGLE transcript entry.
+    // Streaming partials were sent live but not persisted, so this is the
+    // only place the assistant text enters the transcript -- keeping the
+    // transcript compact enough that $slice:-1000 won't drop older turns.
+    // Persist directly (not via sendToPhone) so the phone isn't sent a
+    // duplicate of text it already rendered live.
+    if (shouldPersist && session.lastAssistantText) {
+      const finalTextMsg = createRcMessage(sessionId, session.lastAssistantText, true);
+      if (session.contextPct > 0) finalTextMsg.contextPct = session.contextPct;
+      if (totalCost !== null) finalTextMsg.costUsd = Math.round(totalCost * 10000) / 10000;
+      rcStore.appendTranscript(sessionId, {
+        ts: new Date().toISOString(),
+        type: finalTextMsg.type,
+        data: finalTextMsg
+      }).catch(() => {});
+    }
+    session.lastAssistantText = '';
+    // Live final marker for the phone UI (clears the thinking indicator,
+    // stamps cost/context). Not persisted -- the text entry above covers it.
     const msg = createRcMessage(sessionId, '', true);
     if (session.contextPct > 0) msg.contextPct = session.contextPct;
     if (totalCost !== null) msg.costUsd = Math.round(totalCost * 10000) / 10000;
-    sendToPhone(sessionId, msg, shouldPersist);
+    sendToPhone(sessionId, msg, false);
     return;
   }
 
