@@ -118,10 +118,30 @@ async function killCli(sessionId) {
   }
 }
 
+// Export-JSONL callback: reconstruct a session's authoritative transcript from
+// Claude Code's on-disk JSONL via pc-agent. Used by rc-handler to build the
+// merged phone transcript (JSONL spine + Mongo phone-only entries). Returns []
+// on any failure so the caller falls back to the Mongo transcript.
+async function exportJsonl(workDir, sessionId) {
+  const agentEntry = getAgent('pc-agent');
+  if (!agentEntry || !workDir) return [];
+  const response = await sendDirectAgentRequest(agentEntry, {
+    requestId: crypto.randomUUID(),
+    action: 'remote_session_export_transcript',
+    workDir,
+    sessionId
+  }, 60000);
+  if (response.status !== 'error' && Array.isArray(response.data?.transcript)) {
+    return response.data.transcript;
+  }
+  return [];
+}
+
 initRcHandler(rcStore, deviceConnections, {
   sessionTimeoutMs: config.rcSessionTimeoutMs,
   respawnCli,
-  killCli
+  killCli,
+  exportJsonl
 });
 
 // Sweep stale RC sessions on startup (zombies from prior crashes / desktop disconnects)

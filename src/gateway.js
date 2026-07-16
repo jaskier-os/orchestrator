@@ -11,7 +11,7 @@ import crypto from 'crypto';
 import { handleRequest } from './dispatcher.js';
 import * as registry from './registry.js';
 import { createRequestMessage, parseMessage, serializeMessage, MSG_TYPE } from '@orchestrator/sdk/protocol';
-import { endSession } from './rc-handler.js';
+import { endSession, buildMergedTranscript } from './rc-handler.js';
 import { DEFAULT_ORCHESTRATOR_MODE, validateOrchestratorMode, toCliMode } from './permission-mode.js';
 
 /** Devices that failed speaker verification -- next WS request gets rejection response. */
@@ -1367,39 +1367,11 @@ app.use(async (ctx) => {
         return;
       }
       try {
-        let transcript = await rcStore.getTranscript(sessionId);
-        // Fallback for conversations started directly on the PC: they have no
-        // server-side message history, so reconstruct it from the CLI's on-disk
-        // JSONL via pc-agent. Trigger when Mongo has no RENDERABLE content --
-        // bookkeeping-only transcripts (e.g. a lone rc_session_end from a prior
-        // resume) still count as empty. Phone-created sessions have real
-        // message entries and stay on the fast path, keeping their phone-only
-        // entries (permission prompts) that the JSONL does not contain.
-        const RENDERABLE_TYPES = new Set([
-          'user_message', 'rc_message', 'rc_tool_status',
-          'rc_permission_request', 'rc_permission_resolved', 'text', 'tool'
-        ]);
-        const hasRenderable = Array.isArray(transcript)
-          && transcript.some(e => RENDERABLE_TYPES.has(e?.type));
-        if (!hasRenderable) {
-          const workDir = existing.workDir;
-          const agentEntry = registry.getAgent('pc-agent');
-          if (workDir && agentEntry) {
-            try {
-              const response = await sendDirectAgentRequest(agentEntry, {
-                requestId: uuidv4(),
-                action: 'remote_session_export_transcript',
-                workDir,
-                sessionId
-              }, 60000);
-              if (response.status !== 'error' && Array.isArray(response.data?.transcript)) {
-                transcript = response.data.transcript;
-              }
-            } catch (e) {
-              console.error(`[gateway] RC transcript disk fallback ${sessionId} failed:`, e.message);
-            }
-          }
-        }
+        // JSONL (Claude Code's on-disk record) is the authoritative spine so
+        // PC-only legs are never missing; Mongo's phone-only permission entries
+        // are merged in by timestamp. Falls back to raw Mongo when the JSONL
+        // export is unavailable. Shared with the WS transcript paths.
+        const transcript = await buildMergedTranscript(sessionId, existing.workDir || null);
         ctx.body = { transcript: transcript || [] };
       } catch (err) {
         console.error(`[gateway] RC get transcript ${sessionId} failed:`, err.message);

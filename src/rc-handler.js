@@ -101,6 +101,74 @@ let respawnCliFn = null;
 /** @type {((sessionId: string) => Promise<void>)|null} */
 let killCliFn = null;
 
+// Export-JSONL callback (set by initRcHandler). Reconstructs a session's full
+// transcript from Claude Code's on-disk JSONL via pc-agent. JSONL is the
+// authoritative conversation record: PC-only legs (session resumed directly at
+// the terminal, outside the live RC relay) land only there, never in Mongo. The
+// merged transcript uses it as the spine so the phone stops showing stale
+// history. Returns [] on any failure so the caller falls back to Mongo.
+/** @type {((workDir: string, sessionId: string) => Promise<Array>)|null} */
+let exportJsonlFn = null;
+
+// Coalesce concurrent JSONL exports per session. The phone's resume storm (HTTP
+// retry + WS request + reconnect can all fire within ~1s) would otherwise shell
+// out to the CLI repeatedly. A Map of in-flight promises (cleared on settle)
+// collapses them into one. Unlike a TTL cache this never serves stale content --
+// every settled call reflects disk at call time.
+/** @type {Map<string, Promise<Array>>} */
+const inFlightTranscriptExports = new Map();
+
+function exportJsonlCoalesced(sessionId, workDir) {
+  if (!exportJsonlFn || !workDir) return Promise.resolve([]);
+  const existing = inFlightTranscriptExports.get(sessionId);
+  if (existing) return existing;
+  const p = Promise.resolve()
+    .then(() => exportJsonlFn(workDir, sessionId))
+    .then(arr => (Array.isArray(arr) ? arr : []))
+    .catch(err => {
+      console.error(`[rc-handler] JSONL export failed for ${sessionId}: ${err.message}`);
+      return [];
+    })
+    .finally(() => { inFlightTranscriptExports.delete(sessionId); });
+  inFlightTranscriptExports.set(sessionId, p);
+  return p;
+}
+
+// Phone-only renderable entry types that the JSONL cannot contain (permission
+// prompts are answered on the phone, not recorded by Claude Code). These are
+// spliced back into the JSONL spine so approval cards survive a resume.
+const PHONE_ONLY_TRANSCRIPT_TYPES = new Set(['rc_permission_request', 'rc_permission_resolved']);
+
+/**
+ * Build the transcript payload sent to the phone. JSONL (authoritative, always
+ * current) is the spine; Mongo's phone-only permission entries are merged in by
+ * timestamp. Falls back to the raw Mongo transcript whenever the JSONL export is
+ * unavailable (pc-agent offline, session on another machine, empty, or error) --
+ * strict no-regression.
+ * @param {string} sessionId
+ * @param {string|null} workDir
+ * @returns {Promise<Array>}
+ */
+export async function buildMergedTranscript(sessionId, workDir) {
+  const [mongoRes, jsonlRes] = await Promise.allSettled([
+    rcStore.getTranscript(sessionId),
+    exportJsonlCoalesced(sessionId, workDir)
+  ]);
+  const mongoArr = mongoRes.status === 'fulfilled' && Array.isArray(mongoRes.value) ? mongoRes.value : [];
+  const jsonlArr = jsonlRes.status === 'fulfilled' && Array.isArray(jsonlRes.value) ? jsonlRes.value : [];
+  if (jsonlArr.length === 0) return mongoArr;
+  const perms = mongoArr.filter(e => PHONE_ONLY_TRANSCRIPT_TYPES.has(e?.type));
+  if (perms.length === 0) return jsonlArr;
+  // Stable sort (V8): equal-ts keeps spine-before-perms insertion order.
+  const merged = jsonlArr.concat(perms);
+  merged.sort((a, b) => {
+    const ta = a?.ts || '';
+    const tb = b?.ts || '';
+    return ta < tb ? -1 : ta > tb ? 1 : 0;
+  });
+  return merged;
+}
+
 // Dedup in-flight respawns. Unlike the previous implementation which cleared
 // on spawn-ack, this guard stays until the desktop WS actually connects (the
 // session appears in rcSessions) or a 60s ceiling expires. This prevents the
@@ -112,7 +180,7 @@ const inFlightRespawns = new Map();
  * Initialize RC handler with dependencies.
  * @param {import('./rc-store.js').RcStore} store
  * @param {Map<string, import('ws').WebSocket>} connections
- * @param {{ sessionTimeoutMs?: number, respawnCli?: (sessionId: string, workDir: string, permissionMode: string) => Promise<void>, killCli?: (sessionId: string) => Promise<void> }} [options]
+ * @param {{ sessionTimeoutMs?: number, respawnCli?: (sessionId: string, workDir: string, permissionMode: string) => Promise<void>, killCli?: (sessionId: string) => Promise<void>, exportJsonl?: (workDir: string, sessionId: string) => Promise<Array> }} [options]
  */
 export function initRcHandler(store, connections, options) {
   rcStore = store;
@@ -126,7 +194,10 @@ export function initRcHandler(store, connections, options) {
   if (options?.killCli) {
     killCliFn = options.killCli;
   }
-  console.log(`[rc-handler] Initialized (sessionTimeout=${SESSION_TIMEOUT_MS}ms, respawnCli=${!!respawnCliFn}, killCli=${!!killCliFn})`);
+  if (options?.exportJsonl) {
+    exportJsonlFn = options.exportJsonl;
+  }
+  console.log(`[rc-handler] Initialized (sessionTimeout=${SESSION_TIMEOUT_MS}ms, respawnCli=${!!respawnCliFn}, killCli=${!!killCliFn}, exportJsonl=${!!exportJsonlFn})`);
 }
 
 /**
@@ -1446,7 +1517,10 @@ export function handleRcPhoneMessage(deviceId, envelope, ws) {
     console.log(`[rc-handler] Transcript request for ended session ${endedSessionId}, fetching from store`);
     (async () => {
       try {
-        const transcript = await rcStore.getTranscript(endedSessionId);
+        // Session not in memory -> recover workDir from the store so the JSONL
+        // spine (authoritative history for the last PC leg) can be merged in.
+        const stored = await rcStore.get(endedSessionId).catch(() => null);
+        const transcript = await buildMergedTranscript(endedSessionId, stored?.workDir || null);
         if (transcript.length > 0) {
           const catchUpMsg = createRcTranscriptMessage(endedSessionId, transcript);
           if (ws.readyState === 1) {
@@ -1692,7 +1766,7 @@ export function handleRcPhoneMessage(deviceId, envelope, ws) {
     console.log(`[rc-handler] Transcript request from phone: session=${sessionId}`);
     (async () => {
       try {
-        const transcript = await rcStore.getTranscript(sessionId);
+        const transcript = await buildMergedTranscript(sessionId, session.workDir || null);
         if (transcript.length > 0) {
           const catchUpMsg = createRcTranscriptMessage(sessionId, transcript);
           if (ws.readyState === 1) {
@@ -2018,9 +2092,9 @@ export async function notifyPhoneReconnect(deviceId, ws) {
       console.error(`[rc-handler] Failed to drain pending queue: ${err.message}`);
     }
 
-    // Send transcript for UI catch-up (single source of truth for message history)
+    // Send transcript for UI catch-up. JSONL spine + Mongo phone-only entries.
     try {
-      const transcript = await rcStore.getTranscript(sessionId);
+      const transcript = await buildMergedTranscript(sessionId, session.workDir || null);
       if (transcript.length > 0) {
         const catchUpMsg = createRcTranscriptMessage(sessionId, transcript);
         if (ws.readyState === 1) {
