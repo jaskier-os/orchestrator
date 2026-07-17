@@ -264,8 +264,19 @@ app.use(async (ctx) => {
       ctx.body = { available: false, dirs: [] };
       return;
     }
-    const dirs = agentEntry.manifest.remoteSessionDirs || [];
-    ctx.body = { available: true, dirs };
+    try {
+      const response = await sendDirectAgentRequest(agentEntry, {
+        requestId: uuidv4(),
+        action: 'remote_session_dirs'
+      }, 10000);
+      const dirs = response.data?.dirs || agentEntry.manifest.remoteSessionDirs || [];
+      ctx.body = { available: true, dirs };
+    } catch (err) {
+      // Fall back to static manifest dirs on RPC failure
+      console.error('[gateway] Remote session dirs RPC failed, falling back to manifest:', err.message);
+      const dirs = agentEntry.manifest.remoteSessionDirs || [];
+      ctx.body = { available: true, dirs };
+    }
     return;
   }
 
