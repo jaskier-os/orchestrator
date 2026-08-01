@@ -1266,7 +1266,7 @@ function handleDeviceConnection(ws, request) {
       // For sideload_upload, inject the download URL so the phone can fetch the staged file
       let command = { type: commandType, ...sideloadPayload };
       if (commandType === 'sideload_upload' && command.fileId) {
-        const publicHost = process.env.ORCHESTRATOR_PUBLIC_HOST || null;
+        const publicHost = config.orchestratorPublicHost || null;
         if (!publicHost) {
           safeSend(ws, JSON.stringify({
             type: 'sideload_response',

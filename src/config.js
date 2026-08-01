@@ -20,6 +20,14 @@ const schema = Joi.object({
   copilotHistoryDir: Joi.string().default('./data/copilot-history'),
   mongoUrl: Joi.string().default('mongodb://localhost:27017'),
   rcSessionTimeoutMs: Joi.number().integer().min(1000).default(43_200_000),
+  // Public host[:port] that remote agents dial back for remote-control sessions.
+  // Configuration ONLY -- never derived from a request header. The remote-control
+  // wsUrl carries `Authorization: Bearer <apiKey>`, so a forged Host header would
+  // steer that credential to an attacker-controlled server.
+  orchestratorPublicHost: Joi.string()
+    .pattern(/^[A-Za-z0-9.-]+(:\d{1,5})?$/)
+    .allow('')
+    .default(''),
 }).unknown(false);
 
 const { value, error } = schema.validate({
@@ -42,6 +50,7 @@ const { value, error } = schema.validate({
   copilotHistoryDir: process.env.COPILOT_HISTORY_DIR,
   mongoUrl: process.env.MONGO_URL,
   rcSessionTimeoutMs: process.env.RC_SESSION_TIMEOUT_MS ? Number(process.env.RC_SESSION_TIMEOUT_MS) : undefined,
+  orchestratorPublicHost: process.env.ORCHESTRATOR_PUBLIC_HOST,
 }, { stripUnknown: true });
 
 if (error) {

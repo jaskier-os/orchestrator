@@ -45,7 +45,7 @@ All config is env vars; `.env.example` is the source of truth. Key ones:
 - `LLM_MODEL` -- default model alias forwarded to the Communicator (opus/sonnet/haiku).
 - Peer-service endpoints it routes to: `COMMUNICATOR_URL`, `TTS_URL`, `PIPER_TTS_URL`, `TRANSCRIBER_URL` / `TRANSCRIBER_WS_URL`, `ANTHROPIC_STT_URL`, `TRANSLATOR_URL`, `REID_ANALYTICS_URL`. All default to localhost so the orchestrator runs standalone with no VPN and no certificates.
 - `SESSION_TIMEOUT_MS`, `RC_SESSION_TIMEOUT_MS`, `COMPACTION_THRESHOLD`, `CHAT_HISTORY_DIR`, `COPILOT_HISTORY_DIR` -- session/history behavior.
-- `ORCHESTRATOR_PUBLIC_HOST` -- public host:port that remote agents (pc-agent) dial back for remote-control sessions; falls back to the inbound Host header if unset (set it in production to avoid host-header injection).
+- `ORCHESTRATOR_PUBLIC_HOST` -- public host[:port] that remote agents (pc-agent) dial back for remote-control sessions. Required: `POST /api/v1/remote-sessions/start` returns 503 while it is unset. There is no Host-header fallback -- that URL travels with `API_KEY`, so a forged Host would redirect the credential.
 - `NODE_EXTRA_CA_CERTS` -- optional CA bundle for `wss://`; if unset/missing the SDK BaseAgent stays on plain `ws://` and does not crash.
 
 ### TTS routing (`TTS_ROUTING_MODE`)

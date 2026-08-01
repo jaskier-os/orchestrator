@@ -51,8 +51,8 @@ export function initGateway(cs, sm, dc, js, rs, cps) {
   jobStore = js || null;
   rcStore = rs || null;
   copilotStore = cps || null;
-  if (!process.env.ORCHESTRATOR_PUBLIC_HOST) {
-    console.warn('[gateway] WARN: ORCHESTRATOR_PUBLIC_HOST is not set; falling back to request Host header for SDK wsUrl. Operator should configure this in production to prevent host-header injection.');
+  if (!config.orchestratorPublicHost) {
+    console.warn('[gateway] WARN: ORCHESTRATOR_PUBLIC_HOST is not set; POST /api/v1/remote-sessions/start will return 503. There is no Host-header fallback: that URL is handed out with API_KEY.');
   }
 }
 
@@ -365,9 +365,18 @@ app.use(async (ctx) => {
         registerOrchestratorSessionMode(sessionId, orchestratorMode);
       }
 
-      // TODO: ORCHESTRATOR_PUBLIC_HOST should be configured in production to prevent
-      // host-header injection from leaking the API key in the SDK URL.
-      const publicHost = process.env.ORCHESTRATOR_PUBLIC_HOST || ctx.request.headers.host;
+      // The remote-control wsUrl is handed to pc-agent alongside config.apiKey,
+      // and the CLI dials it with `Authorization: Bearer <apiKey>`. Deriving the
+      // host from ctx.request.headers.host would let any caller aim that
+      // credential at a server they control, so the host comes from
+      // configuration only -- never from the request.
+      const publicHost = config.orchestratorPublicHost;
+      if (!publicHost) {
+        await rcStore.end(sessionId).catch(() => {});
+        ctx.status = 503;
+        ctx.body = { error: { message: 'ORCHESTRATOR_PUBLIC_HOST is not configured; refusing to derive the remote-control URL from the request Host header', status: 503 } };
+        return;
+      }
       const wsUrl = `wss://${publicHost}/ws/remote-control?session=${sessionId}`;
       const requestId = uuidv4();
 
