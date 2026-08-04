@@ -27,6 +27,7 @@ export class BaseAgent {
    * @param {number} [options.healthPort] - Port for HTTP health endpoint (0 = disabled)
    * @param {number} [options.reconnectBaseMs] - Base reconnect delay (default 1000)
    * @param {number} [options.reconnectMaxMs] - Max reconnect delay (default 30000)
+   * @param {number} [options.handshakeTimeoutMs] - Max time to wait for the WS handshake (default 15000)
    */
   constructor(manifest, options = {}) {
     this.manifest = manifest;
@@ -34,6 +35,7 @@ export class BaseAgent {
     this.healthPort = options.healthPort || 0;
     this.reconnectBaseMs = options.reconnectBaseMs || 1000;
     this.reconnectMaxMs = options.reconnectMaxMs || 30000;
+    this.handshakeTimeoutMs = options.handshakeTimeoutMs || 15000;
 
     this.ws = null;
     this.connected = false;
@@ -87,8 +89,11 @@ export class BaseAgent {
 
     console.log(`[${this.manifest.id}] Connecting to orchestrator: ${this.orchestratorUrl}`);
 
-    // Reload CA certs from disk on each reconnect to handle VPN/cert changes
-    const wsOptions = {};
+    // Reload CA certs from disk on each reconnect to handle VPN/cert changes.
+    // handshakeTimeout is required: without it a VPN re-address mid-handshake leaves
+    // the socket ESTAB with no error/close event ever firing, which stalls the
+    // reconnect ladder permanently.
+    const wsOptions = { handshakeTimeout: this.handshakeTimeoutMs };
     const caPath = process.env.NODE_EXTRA_CA_CERTS;
     if (caPath && this.orchestratorUrl.startsWith('wss://')) {
       try {
