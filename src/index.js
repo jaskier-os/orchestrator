@@ -4,6 +4,7 @@ import http from 'http';
 import https from 'https';
 import { StringDecoder } from 'string_decoder';
 import { WebSocket, WebSocketServer } from 'ws';
+import { DeviceStreamRegistry, SseDeviceSocket } from './device-stream.js';
 import config from './config.js';
 import app, { rejectedDevices, initGateway, sendDirectAgentRequest } from './gateway.js';
 import { handleAgentConnection, startHealthChecks, stopHealthChecks, onAgentMessage } from './registry.js';
@@ -65,7 +66,70 @@ const assistantManager = new AssistantManager({
 });
 assistantManager.startCleanup();
 
-const server = http.createServer(app.callback());
+const koaHandler = app.callback();
+const server = http.createServer((req, res) => {
+  // The SSE device stream is handled before Koa: it needs the raw response to
+  // stay open and write frames incrementally, which Koa's buffered body model
+  // fights. Everything else goes through the normal middleware chain.
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  if (url.pathname === '/api/v1/device/stream' && req.method === 'GET') {
+    if (!isAuthorizedDeviceRequest(req, url)) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'Unauthorized', status: 401 } }));
+      return;
+    }
+    handleDeviceStreamRequest(req, res, url);
+    return;
+  }
+  if (url.pathname === '/api/v1/device/send' && req.method === 'POST') {
+    if (!isAuthorizedDeviceRequest(req, url)) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'Unauthorized', status: 401 } }));
+      return;
+    }
+    readRequestBody(req, (err, body) => {
+      if (err) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'Malformed body', status: 400 } }));
+        return;
+      }
+      handleDeviceSendRequest(url.searchParams.get('deviceId'), body, res);
+    });
+    return;
+  }
+  koaHandler(req, res);
+});
+
+/** Same shared-key check the WS and REST surfaces use. */
+function isAuthorizedDeviceRequest(req, url) {
+  // Header only. The key must not travel as a query param: it would land in
+  // Traefik and access logs, and the only client sets the header anyway.
+  const headerKey = req.headers['x-api-key'];
+  const bearer = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+  const supplied = headerKey || bearer;
+  return !!supplied && supplied === config.apiKey;
+}
+
+/** Collect a JSON body, bounded so a bad client cannot exhaust memory. */
+function readRequestBody(req, cb) {
+  const MAX_BODY_BYTES = 8 * 1024 * 1024;
+  const chunks = [];
+  let size = 0;
+  let done = false;
+  req.on('data', chunk => {
+    if (done) return;
+    size += chunk.length;
+    if (size > MAX_BODY_BYTES) {
+      done = true;
+      cb(new Error('body too large'));
+      req.destroy();
+      return;
+    }
+    chunks.push(chunk);
+  });
+  req.on('end', () => { if (!done) { done = true; cb(null, Buffer.concat(chunks).toString('utf8')); } });
+  req.on('error', err => { if (!done) { done = true; cb(err); } });
+}
 
 const wss = new WebSocketServer({ noServer: true });
 
@@ -122,19 +186,35 @@ async function killCli(sessionId) {
 // Claude Code's on-disk JSONL via pc-agent. Used by rc-handler to build the
 // merged phone transcript (JSONL spine + Mongo phone-only entries). Returns []
 // on any failure so the caller falls back to the Mongo transcript.
-async function exportJsonl(workDir, sessionId) {
+// With opts.limit the pc-agent returns a page envelope; this returns
+// { entries, nextCursor, hasMore } in that case and a bare array otherwise, so
+// the unpaged callers are unchanged.
+async function exportJsonl(workDir, sessionId, opts = {}) {
+  const paged = opts.limit != null;
+  // `ok` distinguishes "the JSONL spine has no more entries" from "the JSONL
+  // spine could not be read". Both yield zero entries, but only the second
+  // should fall back to paging Mongo -- treating an exhausted spine as
+  // unavailable would re-serve old permission entries as if they were history.
+  const unavailable = paged ? { entries: [], nextCursor: null, hasMore: false, ok: false } : [];
   const agentEntry = getAgent('pc-agent');
-  if (!agentEntry || !workDir) return [];
+  if (!agentEntry || !workDir) return unavailable;
   const response = await sendDirectAgentRequest(agentEntry, {
     requestId: crypto.randomUUID(),
     action: 'remote_session_export_transcript',
     workDir,
-    sessionId
+    sessionId,
+    ...(paged ? { limit: opts.limit, before: opts.before } : {})
   }, 60000);
   if (response.status !== 'error' && Array.isArray(response.data?.transcript)) {
-    return response.data.transcript;
+    if (!paged) return response.data.transcript;
+    return {
+      entries: response.data.transcript,
+      nextCursor: response.data.nextCursor ?? null,
+      hasMore: response.data.hasMore === true,
+      ok: true
+    };
   }
-  return [];
+  return unavailable;
 }
 
 initRcHandler(rcStore, deviceConnections, {
@@ -328,6 +408,93 @@ server.on('upgrade', (request, socket, head) => {
     });
   }
 });
+
+// SSE device streams. Same message channel as /ws/device, but over a plain
+// streaming HTTPS response plus POSTs, so there is no WebSocket Upgrade for a
+// DPI middlebox to object to. See src/device-stream.js.
+const deviceStreams = new DeviceStreamRegistry();
+/** deviceId -> the SseDeviceSocket standing in for a WebSocket. */
+const sseSockets = new Map();
+/**
+ * How long a device's stream state survives with nothing attached. Long enough
+ * to cover an ordinary reconnect (which is what the replay buffer is for),
+ * short enough that a device that really left does not linger.
+ */
+const SSE_REAP_GRACE_MS = 2 * 60 * 1000;
+
+/**
+ * GET /api/v1/device/stream?deviceId=... -- open an SSE device channel.
+ *
+ * The stream is wrapped in a ws-shaped object and handed to the SAME
+ * handleDeviceConnection used by /ws/device, so the two transports cannot drift
+ * apart in behaviour.
+ */
+export function handleDeviceStreamRequest(req, res, url) {
+  const deviceId = url.searchParams.get('deviceId');
+  if (!deviceId) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'deviceId is required', status: 400 } }));
+    return;
+  }
+  const lastEventIdRaw = req.headers['last-event-id'];
+  const lastEventId = lastEventIdRaw != null ? Number.parseInt(lastEventIdRaw, 10) : null;
+
+  // Reuse the existing socket on a resume so session state (deviceType, RC
+  // bindings) survives a dropped stream rather than being rebuilt. Create it
+  // BEFORE attaching the response, so the message handlers registered by
+  // handleDeviceConnection exist before the synthesized identify is delivered.
+  let socket = sseSockets.get(deviceId);
+  const isNew = !socket;
+  if (isNew) {
+    socket = new SseDeviceSocket(deviceStreams, deviceId);
+    sseSockets.set(deviceId, socket);
+    handleDeviceConnection(socket, req);
+  }
+
+  deviceStreams.attach(deviceId, res, Number.isFinite(lastEventId) ? lastEventId : null);
+
+  // When the last stream for a device goes away, tear down the same
+  // orchestrator-side state the WS path cleans up on close (TTS aborts,
+  // telegram subscriptions, deviceConnections) instead of leaking one socket
+  // and one 500-frame ring per device forever.
+  //
+  // Delayed, because a dropped stream is usually a reconnect: tearing down
+  // instantly would discard the replay buffer that makes resume work at all.
+  res.on('close', () => {
+    setTimeout(() => {
+      if (deviceStreams.isConnected(deviceId)) return; // reconnected in time
+      const current = sseSockets.get(deviceId);
+      if (!current) return;
+      sseSockets.delete(deviceId);
+      deviceStreams.forget(deviceId);
+      current.close(1006, 'sse stream ended');
+      console.log(`[server] SSE device stream reaped: ${deviceId}`);
+    }, SSE_REAP_GRACE_MS).unref();
+  });
+
+  if (isNew) {
+    // The transport carries the device id, so identify never has to be
+    // inferred from the first inbound frame.
+    socket.emitMessage(JSON.stringify({ type: 'identify', deviceId, deviceType: 'phone' }));
+  }
+  console.log(`[server] SSE device stream open: ${deviceId} (resume=${lastEventId ?? 'none'})`);
+}
+
+/**
+ * POST /api/v1/device/send -- inbound frame from an SSE-connected device.
+ * Body is exactly the JSON the phone would have sent over the WebSocket.
+ */
+export function handleDeviceSendRequest(deviceId, body, res) {
+  const socket = deviceId ? sseSockets.get(deviceId) : null;
+  if (!socket) {
+    res.writeHead(409, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'No open stream for device', status: 409 } }));
+    return;
+  }
+  socket.emitMessage(body);
+  res.writeHead(202, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ accepted: true }));
+}
 
 /**
  * Handle device WebSocket connection.

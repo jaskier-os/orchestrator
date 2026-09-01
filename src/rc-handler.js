@@ -118,19 +118,37 @@ let exportJsonlFn = null;
 /** @type {Map<string, Promise<Array>>} */
 const inFlightTranscriptExports = new Map();
 
-function exportJsonlCoalesced(sessionId, workDir) {
-  if (!exportJsonlFn || !workDir) return Promise.resolve([]);
-  const existing = inFlightTranscriptExports.get(sessionId);
+function exportJsonlCoalesced(sessionId, workDir, opts = {}) {
+  const paged = opts.limit != null;
+  // ok=false means the spine could not be READ at all, which is a different
+  // thing from a spine that simply has no more entries. Only the former may
+  // fall back to paging Mongo.
+  const empty = paged ? { entries: [], nextCursor: null, hasMore: false, ok: false } : [];
+  if (!exportJsonlFn || !workDir) return Promise.resolve(empty);
+  // The cache key carries the cursor and limit: two different pages of the same
+  // session are different requests, and keying on sessionId alone would serve
+  // one page's rows for another's cursor.
+  const key = paged ? `${sessionId}|${opts.limit}|${opts.before || ''}` : sessionId;
+  const existing = inFlightTranscriptExports.get(key);
   if (existing) return existing;
   const p = Promise.resolve()
-    .then(() => exportJsonlFn(workDir, sessionId))
-    .then(arr => (Array.isArray(arr) ? arr : []))
+    .then(() => exportJsonlFn(workDir, sessionId, paged ? { limit: opts.limit, before: opts.before } : {}))
+    .then(res => {
+      if (!paged) return Array.isArray(res) ? res : [];
+      if (!res || !Array.isArray(res.entries)) return empty;
+      return {
+        entries: res.entries,
+        nextCursor: res.nextCursor ?? null,
+        hasMore: res.hasMore === true,
+        ok: res.ok !== false
+      };
+    })
     .catch(err => {
       console.error(`[rc-handler] JSONL export failed for ${sessionId}: ${err.message}`);
-      return [];
+      return empty;
     })
-    .finally(() => { inFlightTranscriptExports.delete(sessionId); });
-  inFlightTranscriptExports.set(sessionId, p);
+    .finally(() => { inFlightTranscriptExports.delete(key); });
+  inFlightTranscriptExports.set(key, p);
   return p;
 }
 
@@ -138,6 +156,12 @@ function exportJsonlCoalesced(sessionId, workDir) {
 // prompts are answered on the phone, not recorded by Claude Code). These are
 // spliced back into the JSONL spine so approval cards survive a resume.
 const PHONE_ONLY_TRANSCRIPT_TYPES = new Set(['rc_permission_request', 'rc_permission_resolved']);
+
+// Mirrors the $slice: -1000 cap in rc-store.appendTranscript. Reaching the
+// start of the Mongo array therefore does NOT mean reaching the start of the
+// conversation, which is why the paged path reports `truncated` separately from
+// `hasMore`.
+const MONGO_TRANSCRIPT_CAP = 1000;
 
 /**
  * Build the transcript payload sent to the phone. JSONL (authoritative, always
@@ -167,6 +191,177 @@ export async function buildMergedTranscript(sessionId, workDir) {
     return ta < tb ? -1 : ta > tb ? 1 : 0;
   });
   return merged;
+}
+
+// Rows sent on a WS catch-up. These paths push unsolicited, so they must not
+// ship an entire long conversation -- the phone pages the rest upward over
+// HTTP with the cursor from the same endpoint.
+const WS_CATCHUP_LIMIT = 100;
+
+/**
+ * Newest slice of a session's transcript, for the unsolicited WS catch-up
+ * pushes. Returns a plain array (the rc_transcript envelope's shape) rather
+ * than a page envelope.
+ * @param {string} sessionId
+ * @param {string|null} workDir
+ */
+async function buildCatchUpTranscript(sessionId, workDir) {
+  const page = await buildMergedTranscriptPage(sessionId, workDir, { limit: WS_CATCHUP_LIMIT });
+  return page.transcript;
+}
+
+/**
+ * Stable identity for a transcript entry, used as the cursor tiebreaker. JSONL
+ * entries arrive with a `uid` from the CLI; Mongo permission entries have none,
+ * so one is derived from their content. Sorting on (ts, uid) rather than ts
+ * alone makes the order total, which is what makes it cursorable at all.
+ * @param {Object} entry
+ */
+function entryUid(entry) {
+  if (entry?.uid) return entry.uid;
+  const basis = `${entry?.ts || ''}|${entry?.type || ''}|${JSON.stringify(entry?.data ?? null)}`;
+  return crypto.createHash('sha1').update(basis).digest('hex').slice(0, 12);
+}
+
+/**
+ * Return the entry with its `uid` stamped on, so the derived identity travels
+ * to the phone instead of being recomputed (or lost) there.
+ * @param {Object} entry
+ */
+function withUid(entry) {
+  if (!entry || entry.uid) return entry;
+  return { ...entry, uid: entryUid(entry) };
+}
+
+function compareEntries(a, b) {
+  const ta = a?.ts || '';
+  const tb = b?.ts || '';
+  if (ta !== tb) return ta < tb ? -1 : 1;
+  const ua = entryUid(a);
+  const ub = entryUid(b);
+  return ua < ub ? -1 : ua > ub ? 1 : 0;
+}
+
+function encodeEntryCursor(entry) {
+  return Buffer.from(`${entry?.ts || ''}|${entryUid(entry)}`, 'utf8').toString('base64');
+}
+
+/** Split a cursor back into its (ts, uid) parts. */
+function decodeCursor(cursor) {
+  try {
+    const decoded = Buffer.from(cursor, 'base64').toString('utf8');
+    const sep = decoded.indexOf('|');
+    if (sep === -1) return null;
+    return { ts: decoded.slice(0, sep), uid: decoded.slice(sep + 1) };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * One page of a session's transcript, newest-first.
+ *
+ * Two sources have to agree on a single ordering: the JSONL spine (paged by the
+ * CLI, which owns the parentUuid chain) and Mongo's phone-only permission
+ * entries. The JSONL page defines the window; permission entries whose (ts, uid)
+ * falls inside it are spliced in.
+ *
+ * When JSONL is unavailable the whole thing degrades to paging Mongo alone --
+ * but Mongo's transcript is capped at 1000 entries, so that page is flagged
+ * `truncated` rather than pretending it reached the start of the conversation.
+ *
+ * @param {string} sessionId
+ * @param {string|null} workDir
+ * @param {{ limit: number, before?: string }} opts
+ * @returns {Promise<{ transcript: Array, nextCursor: string|null, hasMore: boolean, truncated: boolean }>}
+ */
+export async function buildMergedTranscriptPage(sessionId, workDir, opts) {
+  const limit = Math.max(1, Math.min(500, opts?.limit || 100));
+  const before = opts?.before || null;
+
+  const [mongoRes, jsonlRes] = await Promise.allSettled([
+    rcStore.getTranscript(sessionId),
+    exportJsonlCoalesced(sessionId, workDir, { limit, before })
+  ]);
+  const mongoArr = mongoRes.status === 'fulfilled' && Array.isArray(mongoRes.value) ? mongoRes.value : [];
+  const jsonlPage = jsonlRes.status === 'fulfilled' && jsonlRes.value && Array.isArray(jsonlRes.value.entries)
+    ? jsonlRes.value
+    : { entries: [], nextCursor: null, hasMore: false, ok: false };
+
+  // --- Mongo-only fallback -------------------------------------------------
+  // buildMergedTranscript's early-returns bypass the merge entirely when one
+  // side is empty; the paged path has to handle that case explicitly or a
+  // session whose JSONL is missing (pc-agent offline, unresolvable project
+  // slug) cannot be paged at all.
+  //
+  // Gated on ok===false, NOT on entries.length: the spine legitimately returns
+  // zero entries once the caller has paged past its first record, and treating
+  // that as "unavailable" would re-serve old permission entries as if they were
+  // more history.
+  if (jsonlPage.ok === false) {
+    const sorted = mongoArr.map(withUid).sort(compareEntries);
+    let end = sorted.length;
+    if (before) {
+      const idx = sorted.findIndex(e => encodeEntryCursor(e) === before);
+      end = idx >= 0 ? idx : Math.min(limit, sorted.length);
+    }
+    const start = Math.max(0, end - limit);
+    const slice = sorted.slice(start, end);
+    return {
+      transcript: slice,
+      nextCursor: slice.length > 0 ? encodeEntryCursor(slice[0]) : null,
+      hasMore: start > 0,
+      // Mongo keeps only the last 1000 entries ($slice: -1000). Reaching its
+      // start is NOT reaching the start of the conversation, and the phone must
+      // be able to say so rather than implying the history is complete.
+      truncated: start === 0 && sorted.length >= MONGO_TRANSCRIPT_CAP
+    };
+  }
+
+  // Spine exhausted: the caller has paged past the oldest JSONL record.
+  if (jsonlPage.entries.length === 0) {
+    return { transcript: [], nextCursor: null, hasMore: false, truncated: false };
+  }
+
+  // --- JSONL spine + Mongo permission entries ------------------------------
+  // withUid stamps the derived identity onto the entry so it survives to the
+  // phone: without it a Mongo entry arrives with no uid, the phone assigns a
+  // random row id, and the same permission card can render twice if two pages
+  // ever overlap.
+  const perms = mongoArr.filter(e => PHONE_ONLY_TRANSCRIPT_TYPES.has(e?.type)).map(withUid);
+  const pageEntries = [...jsonlPage.entries].sort(compareEntries);
+  const oldest = pageEntries[0];
+  const newest = pageEntries[pageEntries.length - 1];
+  // Window is [page-oldest-key, requested-cursor). Anchoring the upper bound on
+  // the cursor the caller passed -- rather than on this page's newest entry --
+  // makes consecutive pages tile exactly: the next request's cursor IS this
+  // page's oldest key, so every permission entry lands on exactly one page,
+  // with no gap between windows and no overlap. The newest page has no cursor
+  // and so has no upper bound; the last page takes everything older, since a
+  // permission entry older than the whole spine has no page of its own.
+  const isLastPage = jsonlPage.hasMore !== true;
+  const upperBound = before ? decodeCursor(before) : null;
+  const inWindow = perms.filter(p => {
+    // The newest page (no cursor) has no upper bound -- it is the tail, and a
+    // permission entry newer than the last spine record still belongs on it.
+    if (upperBound && compareEntries(p, upperBound) >= 0) return false;
+    if (isLastPage) return true;
+    return compareEntries(p, oldest) >= 0;
+  });
+
+  const merged = pageEntries.concat(inWindow).sort(compareEntries);
+  return {
+    transcript: merged,
+    // The cursor always comes from the JSONL spine so paging stays anchored to
+    // the authoritative record even when permission entries share a timestamp.
+    nextCursor: jsonlPage.nextCursor,
+    // Never from Mongo: it is capped and would claim the conversation ends at
+    // 1000 entries. Older permission entries are flushed into the last page
+    // above rather than extending hasMore, which would spin forever since the
+    // cursor cannot advance past the spine.
+    hasMore: jsonlPage.hasMore === true,
+    truncated: false
+  };
 }
 
 // Dedup in-flight respawns. Unlike the previous implementation which cleared
@@ -1631,7 +1826,7 @@ export function handleRcPhoneMessage(deviceId, envelope, ws) {
         // Session not in memory -> recover workDir from the store so the JSONL
         // spine (authoritative history for the last PC leg) can be merged in.
         const stored = await rcStore.get(endedSessionId).catch(() => null);
-        const transcript = await buildMergedTranscript(endedSessionId, stored?.workDir || null);
+        const transcript = await buildCatchUpTranscript(endedSessionId, stored?.workDir || null);
         if (transcript.length > 0) {
           const catchUpMsg = createRcTranscriptMessage(endedSessionId, transcript);
           if (ws.readyState === 1) {
@@ -1877,7 +2072,7 @@ export function handleRcPhoneMessage(deviceId, envelope, ws) {
     console.log(`[rc-handler] Transcript request from phone: session=${sessionId}`);
     (async () => {
       try {
-        const transcript = await buildMergedTranscript(sessionId, session.workDir || null);
+        const transcript = await buildCatchUpTranscript(sessionId, session.workDir || null);
         if (transcript.length > 0) {
           const catchUpMsg = createRcTranscriptMessage(sessionId, transcript);
           if (ws.readyState === 1) {
@@ -2205,7 +2400,7 @@ export async function notifyPhoneReconnect(deviceId, ws) {
 
     // Send transcript for UI catch-up. JSONL spine + Mongo phone-only entries.
     try {
-      const transcript = await buildMergedTranscript(sessionId, session.workDir || null);
+      const transcript = await buildCatchUpTranscript(sessionId, session.workDir || null);
       if (transcript.length > 0) {
         const catchUpMsg = createRcTranscriptMessage(sessionId, transcript);
         if (ws.readyState === 1) {

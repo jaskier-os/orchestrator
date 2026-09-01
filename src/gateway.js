@@ -11,7 +11,7 @@ import crypto from 'crypto';
 import { handleRequest } from './dispatcher.js';
 import * as registry from './registry.js';
 import { createRequestMessage, parseMessage, serializeMessage, MSG_TYPE } from '@orchestrator/sdk/protocol';
-import { endSession, buildMergedTranscript } from './rc-handler.js';
+import { endSession, buildMergedTranscript, buildMergedTranscriptPage } from './rc-handler.js';
 import { DEFAULT_ORCHESTRATOR_MODE, validateOrchestratorMode, toCliMode } from './permission-mode.js';
 
 /** Devices that failed speaker verification -- next WS request gets rejection response. */
@@ -1391,6 +1391,31 @@ app.use(async (ctx) => {
         // PC-only legs are never missing; Mongo's phone-only permission entries
         // are merged in by timestamp. Falls back to raw Mongo when the JSONL
         // export is unavailable. Shared with the WS transcript paths.
+        //
+        // ?limit=N[&before=cursor] returns one page, newest-first, so opening a
+        // long conversation does not ship the whole history. Without `limit`
+        // the response is the full transcript exactly as before.
+        const limitRaw = ctx.query.limit;
+        if (limitRaw !== undefined) {
+          const limit = Number.parseInt(limitRaw, 10);
+          if (!Number.isFinite(limit) || limit <= 0) {
+            ctx.status = 400;
+            ctx.body = { error: { message: 'limit must be a positive integer', status: 400 } };
+            return;
+          }
+          const page = await buildMergedTranscriptPage(sessionId, existing.workDir || null, {
+            limit,
+            before: ctx.query.before || null
+          });
+          ctx.body = {
+            transcript: page.transcript,
+            nextCursor: page.nextCursor,
+            hasMore: page.hasMore,
+            truncated: page.truncated,
+            limit
+          };
+          return;
+        }
         const transcript = await buildMergedTranscript(sessionId, existing.workDir || null);
         ctx.body = { transcript: transcript || [] };
       } catch (err) {
