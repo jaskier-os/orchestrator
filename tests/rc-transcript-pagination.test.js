@@ -50,6 +50,14 @@ function makeJsonlPager(all) {
   };
 }
 
+/**
+ * A pc-agent that predates paging: it ignores limit/before and returns the
+ * whole transcript as a bare array. The orchestrator must page it anyway.
+ */
+function legacyJsonlExporter(all) {
+  return () => Promise.resolve(all);
+}
+
 /** A spine that cannot be read at all: pc-agent offline, bad project slug. */
 function unreadableJsonl() {
   return (workDir, sessionId, opts) =>
@@ -73,6 +81,14 @@ function install(jsonlAll) {
     { getTranscript: async () => mongoTranscript },
     new Map(),
     { exportJsonl: makeJsonlPager(jsonlAll) }
+  );
+}
+
+function installLegacy(jsonlAll) {
+  initRcHandler(
+    { getTranscript: async () => mongoTranscript },
+    new Map(),
+    { exportJsonl: legacyJsonlExporter(jsonlAll) }
   );
 }
 
@@ -316,6 +332,33 @@ async function testMongoEntriesCarryUid() {
       .transcript.find(e => e.type === 'rc_permission_request')?.uid === perm.uid);
 }
 
+// --- 9: an exporter that ignores the flags is paged server-side ----------
+
+async function testLegacyExporterIsPagedAnyway() {
+  console.log('\na pc-agent that ignores the paging flags is sliced server-side');
+  // Caught against the live deployment: the running pc-agent predated the
+  // flags, returned all 5521 entries for ?limit=10, and the orchestrator
+  // served them verbatim -- defeating the entire feature.
+  const all = jsonlEntries(300);
+  mongoTranscript = [];
+  installLegacy(all);
+
+  const p1 = await buildMergedTranscriptPage(SID, WD, { limit: 10 });
+  check('page respects the limit despite the exporter ignoring it',
+    p1.transcript.length === 10, `got ${p1.transcript.length}`);
+  check('page is the newest slice',
+    p1.transcript[p1.transcript.length - 1].uid === all[all.length - 1].uid);
+  check('hasMore is set', p1.hasMore === true);
+  check('a cursor is issued', !!p1.nextCursor);
+
+  const p2 = await buildMergedTranscriptPage(SID, WD, { limit: 10, before: p1.nextCursor });
+  check('the cursor pages backward correctly',
+    p2.transcript.map(e => e.uid).join() === all.slice(280, 290).map(e => e.uid).join(),
+    p2.transcript.map(e => e.uid).slice(0, 3).join());
+  check('adjacent pages do not overlap',
+    !p2.transcript.some(e => p1.transcript.some(x => x.uid === e.uid)));
+}
+
 // --- run -----------------------------------------------------------------
 
 (async () => {
@@ -327,6 +370,7 @@ async function testMongoEntriesCarryUid() {
   await testExhaustedSpineIsNotAFallback();
   await testNoDuplicatePermissionsAcrossBoundary();
   await testMongoEntriesCarryUid();
+  await testLegacyExporterIsPagedAnyway();
 
   console.log(`\n${failures === 0 ? 'ALL PASS' : `${failures} FAILURE(S)`}`);
   process.exit(failures === 0 ? 0 : 1);

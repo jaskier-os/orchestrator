@@ -118,6 +118,35 @@ let exportJsonlFn = null;
 /** @type {Map<string, Promise<Array>>} */
 const inFlightTranscriptExports = new Map();
 
+/**
+ * Page a full transcript the exporter returned unsliced.
+ *
+ * The CLI does the slicing when it supports it; this is the fallback for a
+ * pc-agent that predates the flags, so the phone still gets a page instead of
+ * the whole conversation. Mirrors exportTranscriptPageImpl's semantics,
+ * including serving the OLDEST page for a cursor that no longer resolves --
+ * repeating the newest page would loop the phone on the same rows.
+ * @param {Array} all
+ * @param {{ limit: number, before?: string|null }} opts
+ */
+function sliceUnpagedExport(all, opts) {
+  const limit = Math.max(1, opts.limit);
+  let end = all.length;
+  if (opts.before) {
+    const uid = decodeCursor(opts.before)?.uid;
+    const idx = uid ? all.findIndex(e => entryUid(e) === uid) : -1;
+    end = idx >= 0 ? idx : Math.min(limit, all.length);
+  }
+  const start = Math.max(0, end - limit);
+  const entries = all.slice(start, end);
+  return {
+    entries,
+    nextCursor: entries.length > 0 ? encodeEntryCursor(entries[0]) : null,
+    hasMore: start > 0,
+    ok: true
+  };
+}
+
 function exportJsonlCoalesced(sessionId, workDir, opts = {}) {
   const paged = opts.limit != null;
   // ok=false means the spine could not be READ at all, which is a different
@@ -135,7 +164,18 @@ function exportJsonlCoalesced(sessionId, workDir, opts = {}) {
     .then(() => exportJsonlFn(workDir, sessionId, paged ? { limit: opts.limit, before: opts.before } : {}))
     .then(res => {
       if (!paged) return Array.isArray(res) ? res : [];
+      // A pc-agent that predates paging ignores the flags and returns the whole
+      // transcript as a bare array. Slice it here rather than serving thousands
+      // of entries to a phone that asked for a page -- the point of the feature
+      // is that a long conversation never ships whole.
+      if (Array.isArray(res)) {
+        return sliceUnpagedExport(res, opts);
+      }
       if (!res || !Array.isArray(res.entries)) return empty;
+      // Same guard for an envelope whose entries were not actually limited.
+      if (res.entries.length > opts.limit) {
+        return sliceUnpagedExport(res.entries, opts);
+      }
       return {
         entries: res.entries,
         nextCursor: res.nextCursor ?? null,
