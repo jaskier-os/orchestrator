@@ -27,6 +27,13 @@ const RING_CAPACITY = 500;
 const PING_INTERVAL_MS = 15000;
 
 /**
+ * How long after a stream drops we keep reporting the device as reachable, so
+ * frames generated during a reconnect are buffered for replay instead of being
+ * skipped by callers that check readyState first.
+ */
+const RESUME_WINDOW_MS = 30000;
+
+/**
  * Unflushed bytes tolerated on one stream before it is dropped as stalled.
  * Roughly one large TTS payload's worth of slack.
  */
@@ -46,6 +53,8 @@ class DeviceStream {
     this.seq = 0;
     this.buf = [];
     this.conns = new Set();
+    /** When the last stream detached, or null while one is attached. */
+    this.detachedAt = null;
   }
 
   /**
@@ -95,6 +104,25 @@ class DeviceStream {
 
   get open() {
     return this.conns.size > 0;
+  }
+
+  /**
+   * Whether a frame sent now can still reach the client.
+   *
+   * True while a stream is attached, and for a short window after the last one
+   * dropped -- a dropped SSE stream is usually a reconnect in progress, and the
+   * frame will be replayed from the ring. Callers gate on this (via
+   * readyState) BEFORE handing a frame over, so reporting closed the instant
+   * the socket goes means the frame is never buffered and the resume path has
+   * nothing to replay.
+   *
+   * Past the window we report closed so the durable Mongo queue takes over --
+   * the ring is bounded and must not be mistaken for long-term storage.
+   */
+  get deliverable() {
+    if (this.conns.size > 0) return true;
+    if (!this.detachedAt) return false;
+    return Date.now() - this.detachedAt < RESUME_WINDOW_MS;
   }
 }
 
@@ -168,6 +196,7 @@ export class DeviceStreamRegistry {
     }
 
     stream.conns.add(res);
+    stream.detachedAt = null;
     const ping = setInterval(() => {
       if (res.writableEnded || res.destroyed) return;
       try { res.write(': ping\n\n'); } catch { /* closed under us */ }
@@ -177,6 +206,7 @@ export class DeviceStreamRegistry {
     const detach = () => {
       clearInterval(ping);
       stream.conns.delete(res);
+      if (stream.conns.size === 0) stream.detachedAt = Date.now();
     };
     res.on('close', detach);
     res.on('error', detach);
@@ -194,8 +224,18 @@ export class DeviceStreamRegistry {
     return this.get(deviceId).push(payload);
   }
 
+  /** A stream is currently attached. Used to decide when to reap state. */
   isConnected(deviceId) {
     return this.streams.get(deviceId)?.open === true;
+  }
+
+  /**
+   * A frame sent now can still reach the client, counting a brief reconnect
+   * window. This is what readyState reports, so callers that check before
+   * sending still hand frames over during a reconnect.
+   */
+  isDeliverable(deviceId) {
+    return this.streams.get(deviceId)?.deliverable === true;
   }
 
   /** Drop a device's state entirely (device removed, not merely disconnected). */
@@ -225,9 +265,16 @@ export class SseDeviceSocket {
     this._handlers = { message: [], close: [], error: [] };
   }
 
-  /** Mirrors WebSocket.OPEN(1) / CLOSED(3) so readyState checks work as-is. */
+  /**
+   * Mirrors WebSocket.OPEN(1) / CLOSED(3) so readyState checks work as-is.
+   *
+   * Reports open through a brief reconnect window, not just while a stream is
+   * literally attached: callers check this and then send, so a momentary gap
+   * would make them skip the frame entirely and the resume buffer would have
+   * nothing to replay.
+   */
   get readyState() {
-    return this.registry.isConnected(this.deviceId) ? 1 : 3;
+    return this.registry.isDeliverable(this.deviceId) ? 1 : 3;
   }
 
   /**

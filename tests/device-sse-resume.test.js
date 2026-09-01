@@ -223,21 +223,39 @@ function testWsCompatibility() {
 function testBufferingWhileDetached() {
   console.log('\nframes sent while detached are delivered on resume');
   const reg = new DeviceStreamRegistry();
+  const sock = new SseDeviceSocket(reg, DEV);
   const first = new FakeRes();
   reg.attach(DEV, first, null);
   reg.send(DEV, JSON.stringify({ n: 1 }));
   first.end();
 
-  // Nothing attached: these must still be retained.
-  reg.send(DEV, JSON.stringify({ n: 2 }));
-  reg.send(DEV, JSON.stringify({ n: 3 }));
-  check('send reports no live delivery while detached',
-    reg.isConnected(DEV) === false);
+  // THE REGRESSION THIS GUARDS: orchestrator senders check readyState and only
+  // then send (safeSend in index.js, and every `ws.readyState === 1` site).
+  // If readyState went CLOSED the instant the stream detached, those callers
+  // would skip the frame entirely -- it would never reach the ring, and resume
+  // would replay nothing. Verified against the live deployment, where exactly
+  // that produced "resume delivered 0 frames".
+  check('readyState stays OPEN through the reconnect window',
+    sock.readyState === 1, `got ${sock.readyState}`);
+  check('no stream is literally attached', reg.isConnected(DEV) === false);
+
+  // Send the way the orchestrator does: guarded by readyState.
+  for (const n of [2, 3]) {
+    if (sock.readyState === 1) sock.send(JSON.stringify({ n }));
+  }
 
   const resumed = new FakeRes();
   reg.attach(DEV, resumed, 1);
   const ids = resumed.events.filter(e => e.event === 'message').map(e => e.id);
   check('frames sent while offline are replayed', ids.join() === '2,3', ids.join());
+
+  // Past the window the device is genuinely gone and the durable Mongo queue
+  // must take over -- the ring is bounded and is not long-term storage.
+  reg.get(DEV).detachedAt = Date.now() - 60_000;
+  const goneSock = new SseDeviceSocket(reg, DEV);
+  reg.get(DEV).conns.clear();
+  check('readyState reports CLOSED once the window lapses',
+    goneSock.readyState === 3, `got ${goneSock.readyState}`);
 }
 
 function testRestartResync() {
