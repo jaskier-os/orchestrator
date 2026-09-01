@@ -296,6 +296,125 @@ function resetTurnTimer(sessionId, session) {
   }, TURN_TIMEOUT_MS);
 }
 
+/**
+ * Interval between `running` heartbeats for an in-flight tool.
+ */
+const TOOL_HEARTBEAT_MS = 2000;
+
+/**
+ * Stamp a monotonically increasing per-tool sequence number on an
+ * rc_tool_status envelope. sendToPhone is async, so a heartbeat scheduled just
+ * before a tool_result can land AFTER the 'complete' frame; the phone upserts
+ * tool rows by toolCallId, so without an ordering stamp a late 'running' would
+ * overwrite 'complete' and strand the row as permanently in-flight. The phone
+ * drops any status whose seq is lower than the one it already applied.
+ * @param {Object} session
+ * @param {Object} msg rc_tool_status envelope
+ */
+function stampToolSeq(session, msg) {
+  if (!session.toolSeq) session.toolSeq = new Map();
+  const key = msg.toolCallId || msg.toolName || 'unknown';
+  const next = (session.toolSeq.get(key) || 0) + 1;
+  session.toolSeq.set(key, next);
+  msg.seq = next;
+  return msg;
+}
+
+/**
+ * Emit one `running` heartbeat per in-flight tool. Runs on a single
+ * per-session interval (not one timer per tool) so a turn with many concurrent
+ * tools cannot flood the phone.
+ * @param {string} sessionId
+ * @param {Object} session
+ */
+function emitToolHeartbeats(sessionId, session) {
+  if (!session.toolInFlight || session.toolInFlight.size === 0) return;
+  const now = Date.now();
+  for (const [toolCallId, entry] of session.toolInFlight) {
+    const elapsedMs = now - entry.startedAt;
+    // Skip fast tools: a Read that returns in 300ms should never produce a
+    // heartbeat row. The margin keeps the first beat on the 2s tick rather than
+    // slipping to the next one on timer jitter.
+    if (elapsedMs < TOOL_HEARTBEAT_MS - 250) continue;
+    const hb = stampToolSeq(session, createRcToolStatusMessage(
+      sessionId, entry.toolName, 'running', entry.input || null, null, toolCallId
+    ));
+    hb.elapsedMs = elapsedMs;
+    const meta = session.agentMeta ? session.agentMeta.get(toolCallId) : null;
+    if (meta) {
+      // Reset the turn timer if the sub-agent made real progress (new tokens
+      // spent or tools called) since the last heartbeat, so active work isn't
+      // killed by a stale timer.
+      const curTokens = meta.liveTokens || 0;
+      const curTools = meta.liveToolCount || 0;
+      if (curTokens > (meta._prevTokens || 0) || curTools > (meta._prevToolCount || 0)) {
+        resetTurnTimer(sessionId, session);
+        meta._prevTokens = curTokens;
+        meta._prevToolCount = curTools;
+      }
+      hb.isAgent = true;
+      if (meta.agentName) hb.agentName = meta.agentName;
+      if (meta.agentTask) hb.agentTask = meta.agentTask;
+      hb.agentElapsedMs = elapsedMs;
+      // Forward live-accumulated counts so the row keeps showing tools/tokens
+      // between sub-agent message arrivals. Claude Code's stream-json does not
+      // forward subagent tool_use/usage events to the parent in real time --
+      // the final counts only arrive with the tool_result.
+      if (meta.liveTokens != null) hb.agentTokens = meta.liveTokens;
+      if (meta.liveToolCount != null) hb.agentToolCount = meta.liveToolCount;
+    }
+    if (session.contextPct > 0) hb.contextPct = session.contextPct;
+    // Never persisted: the transcript is capped at 1000 entries, and
+    // heartbeats would evict real history.
+    sendToPhone(sessionId, hb, false);
+  }
+}
+
+/**
+ * Record a tool as in-flight and arm the session heartbeat if it isn't running.
+ * @param {string} sessionId
+ * @param {Object} session
+ * @param {string} toolCallId
+ * @param {string} toolName
+ * @param {Object|null} input
+ */
+function trackToolStart(sessionId, session, toolCallId, toolName, input) {
+  if (!toolCallId) return;
+  if (!session.toolInFlight) session.toolInFlight = new Map();
+  session.toolInFlight.set(toolCallId, { toolName, input: input || null, startedAt: Date.now() });
+  if (!session.toolHeartbeatTimer) {
+    session.toolHeartbeatTimer = setInterval(
+      () => emitToolHeartbeats(sessionId, session), TOOL_HEARTBEAT_MS
+    );
+  }
+}
+
+/**
+ * Drop a tool from the in-flight set and disarm the heartbeat once empty.
+ * @param {Object} session
+ * @param {string} toolCallId
+ */
+function trackToolEnd(session, toolCallId) {
+  if (!session.toolInFlight) return;
+  if (toolCallId) session.toolInFlight.delete(toolCallId);
+  if (session.toolInFlight.size === 0) stopToolHeartbeat(session);
+}
+
+/**
+ * Clear the session heartbeat interval and forget all in-flight tools.
+ * @param {Object} session
+ */
+function stopToolHeartbeat(session) {
+  if (session.toolHeartbeatTimer) {
+    clearInterval(session.toolHeartbeatTimer);
+    session.toolHeartbeatTimer = null;
+  }
+  if (session.toolInFlight) session.toolInFlight.clear();
+  // toolSeq is per-invocation and grows for the life of the session, so drop it
+  // once nothing is in flight.
+  if (session.toolSeq) session.toolSeq.clear();
+}
+
 function emitThinking(sessionId, session, text) {
   if (!session.thinkingStartedAt) {
     session.thinkingStartedAt = Date.now();
@@ -315,7 +434,23 @@ function emitThinking(sessionId, session, text) {
  * @param {Object} session
  */
 function emitThinkingEnd(sessionId, session) {
-  if (!session || !session.thinkingStartedAt) return;
+  if (!session) return;
+  // Safety net for a tool_use whose tool_result never arrived (interrupt, CLI
+  // crash) -- without it the heartbeat interval would outlive the turn. A tool
+  // that IS still legitimately running keeps its heartbeat: on a real turn end
+  // the tool_result always precedes this, so a non-empty set here means the
+  // result was lost, and we emit a terminal frame so the phone's row does not
+  // stay in-flight forever.
+  if (session.toolInFlight && session.toolInFlight.size > 0) {
+    for (const [toolCallId, entry] of session.toolInFlight) {
+      sendToPhone(sessionId, stampToolSeq(session, createRcToolStatusMessage(
+        sessionId, entry.toolName, 'error', entry.input || null,
+        'Tool did not report a result before the turn ended.', toolCallId
+      )), false);
+    }
+  }
+  stopToolHeartbeat(session);
+  if (!session.thinkingStartedAt) return;
   const elapsedMs = Date.now() - session.thinkingStartedAt;
   session.thinkingStartedAt = null;
   // Clear turn-level timeout
@@ -618,14 +753,9 @@ function cleanupSession(sessionId, session) {
   session.replayInProgress = false;
   session.replayPhoneBuffer = null;
 
-  // Stop any in-flight agent heartbeat timers to prevent leaks.
+  // Stop the in-flight tool heartbeat to prevent a timer leak.
+  stopToolHeartbeat(session);
   if (session.agentMeta) {
-    for (const meta of session.agentMeta.values()) {
-      if (meta && meta.heartbeatTimer) {
-        clearInterval(meta.heartbeatTimer);
-        meta.heartbeatTimer = null;
-      }
-    }
     session.agentMeta.clear();
   }
 
@@ -1027,17 +1157,18 @@ function processDesktopMessage(sessionId, session, parsed) {
             : Array.isArray(block.content)
               ? block.content.filter(c => c.type === 'text').map(c => c.text).join('\n').substring(0, 2000)
               : null;
-          const completeMsg = createRcToolStatusMessage(
+          // Stamp BEFORE clearing in-flight state: trackToolEnd may reset the
+          // seq counters, and a 'complete' stamped with a lower seq than the
+          // heartbeats that preceded it would be dropped by the phone's
+          // out-of-order guard.
+          const completeMsg = stampToolSeq(session, createRcToolStatusMessage(
             sessionId, toolName, 'complete', storedArgs, resultContent, toolUseId
-          );
+          ));
+          trackToolEnd(session, toolUseId);
           // Re-attach agent metadata so the phone preserves the Agent label
           // on the completion event (toolName="Task" alone isn't enough).
           const agentMeta = toolUseId && session.agentMeta ? session.agentMeta.get(toolUseId) : null;
           if (agentMeta) {
-            if (agentMeta.heartbeatTimer) {
-              clearInterval(agentMeta.heartbeatTimer);
-              agentMeta.heartbeatTimer = null;
-            }
             completeMsg.isAgent = true;
             if (agentMeta.agentName) completeMsg.agentName = agentMeta.agentName;
             if (agentMeta.agentTask) completeMsg.agentTask = agentMeta.agentTask;
@@ -1117,67 +1248,43 @@ function processDesktopMessage(sessionId, session, parsed) {
         textParts.push(block);
       } else if (block.type === 'text' && block.text) {
         textParts.push(block.text);
-      } else if (block.type === 'thinking' && block.text) {
-        emitThinking(sessionId, session, block.text);
+      } else if (block.type === 'thinking' && (block.thinking || block.text)) {
+        // Anthropic thinking blocks carry the text in `thinking`, not `text`.
+        emitThinking(sessionId, session, block.thinking || block.text);
       } else if (block.type === 'tool_use') {
         if (!session.lastToolArgs) session.lastToolArgs = new Map();
         if (!session.toolUseIdToName) session.toolUseIdToName = new Map();
         if (!session.agentMeta) session.agentMeta = new Map();
         session.lastToolArgs.set(block.id || block.name || 'unknown', block.input || null);
         if (block.id) session.toolUseIdToName.set(block.id, block.name || 'unknown');
-        const statusMsg = createRcToolStatusMessage(
+        const statusMsg = stampToolSeq(session, createRcToolStatusMessage(
           sessionId,
           block.name || 'unknown',
           'calling',
           block.input || null,
           null,
           block.id || null
-        );
+        ));
         const { isAgent, agentName, agentTask } = describeAgentDispatch(block);
         if (isAgent) {
           statusMsg.isAgent = true;
           if (agentName) statusMsg.agentName = agentName;
           if (agentTask) statusMsg.agentTask = agentTask;
           if (block.id) {
-            const meta = { toolName: block.name || 'Task', agentName, agentTask, startedAt: Date.now(), heartbeatTimer: null };
-            // Heartbeat: emit a periodic rc_tool_status so the phone can refresh
-            // the agent row's elapsed counter from a fresh server timestamp.
-            // Note: Claude Code's CLI stream-json does NOT forward subagent
-            // tool_use/usage events to the parent in real time -- the spawned
-            // subprocess returns a single tool_result with a trailing <usage>
-            // block on completion. So we cannot stream true incremental tool
-            // count or token usage. The heartbeat is a status keep-alive
-            // (Option C in the design doc) -- the counts only arrive at Complete.
-            const HEARTBEAT_MS = 2000;
-            meta._prevTokens = 0;
-            meta._prevToolCount = 0;
-            meta.heartbeatTimer = setInterval(() => {
-              const stillTracked = session.agentMeta && session.agentMeta.get(block.id);
-              if (!stillTracked) return;
-              // Reset turn timer if the sub-agent made real progress (new
-              // tokens spent or tools called) since the last heartbeat.
-              const curTokens = meta.liveTokens || 0;
-              const curTools = meta.liveToolCount || 0;
-              if (curTokens > meta._prevTokens || curTools > meta._prevToolCount) {
-                resetTurnTimer(sessionId, session);
-                meta._prevTokens = curTokens;
-                meta._prevToolCount = curTools;
-              }
-              const hb = createRcToolStatusMessage(sessionId, block.name || 'unknown', 'running', block.input || null, null, block.id || null);
-              hb.isAgent = true;
-              if (agentName) hb.agentName = agentName;
-              if (agentTask) hb.agentTask = agentTask;
-              hb.agentElapsedMs = Date.now() - meta.startedAt;
-              // Forward live-accumulated counts (Tier A) so the row keeps
-              // showing tools/tokens even between sub-agent message arrivals.
-              if (meta.liveTokens != null) hb.agentTokens = meta.liveTokens;
-              if (meta.liveToolCount != null) hb.agentToolCount = meta.liveToolCount;
-              if (session.contextPct > 0) hb.contextPct = session.contextPct;
-              sendToPhone(sessionId, hb, false);
-            }, HEARTBEAT_MS);
-            session.agentMeta.set(block.id, meta);
+            session.agentMeta.set(block.id, {
+              toolName: block.name || 'Task',
+              agentName,
+              agentTask,
+              startedAt: Date.now(),
+              _prevTokens: 0,
+              _prevToolCount: 0
+            });
           }
         }
+        // Every tool -- agent or not -- goes into the in-flight set so the
+        // phone gets 'running' heartbeats for anything slow (TaskOutput can
+        // block for minutes with no intermediate CLI event of its own).
+        trackToolStart(sessionId, session, block.id, block.name || 'unknown', block.input || null);
         if (session.contextPct > 0) statusMsg.contextPct = session.contextPct;
         sendToPhone(sessionId, statusMsg, false);
       }
@@ -1222,14 +1329,15 @@ function processDesktopMessage(sessionId, session, parsed) {
   if (type === 'tool_use') {
     if (!session.lastToolArgs) session.lastToolArgs = new Map();
     session.lastToolArgs.set(parsed.id || parsed.name || 'unknown', parsed.input || null);
-    sendToPhone(sessionId, createRcToolStatusMessage(
+    trackToolStart(sessionId, session, parsed.id, parsed.name || 'unknown', parsed.input || null);
+    sendToPhone(sessionId, stampToolSeq(session, createRcToolStatusMessage(
       sessionId,
       parsed.name || 'unknown',
       'calling',
       parsed.input || null,
       null,
       parsed.id || null
-    ), false);
+    )), false);
     return;
   }
 
@@ -1240,7 +1348,8 @@ function processDesktopMessage(sessionId, session, parsed) {
     const storedArgs = session.lastToolArgs?.get(topLevelToolUseId || toolName) || null;
     console.log(`[rc-handler] tool_result: tool=${toolName} toolUseId=${topLevelToolUseId} hasStoredArgs=${!!storedArgs} lastToolArgsKeys=${session.lastToolArgs ? [...session.lastToolArgs.keys()].join(',') : 'none'}`);
     if (storedArgs) session.lastToolArgs.delete(topLevelToolUseId || toolName);
-    sendToPhone(sessionId, createRcToolStatusMessage(
+    // Stamp before clearing in-flight state (see the tool_result branch above).
+    const topLevelComplete = stampToolSeq(session, createRcToolStatusMessage(
       sessionId,
       toolName,
       'complete',
@@ -1248,6 +1357,8 @@ function processDesktopMessage(sessionId, session, parsed) {
       typeof parsed.content === 'string' ? parsed.content.substring(0, 2000) : null,
       topLevelToolUseId
     ));
+    trackToolEnd(session, topLevelToolUseId);
+    sendToPhone(sessionId, topLevelComplete);
     return;
   }
 
@@ -2187,6 +2298,30 @@ export function bindSessionToPhone(sessionId, deviceId) {
     session.phoneDeviceId = deviceId;
     console.log(`[rc-handler] Bound session ${sessionId} to phone ${deviceId}`);
   }
+}
+
+/**
+ * Drive the CLI stream-json handler directly against a caller-supplied session
+ * object. Exists so the tool-status and thinking event paths can be tested
+ * without standing up a CLI, a phone WS and MongoDB.
+ * @param {string} sessionId
+ * @param {Object} session
+ * @param {Object} parsed a stream-json event
+ */
+export function __processDesktopMessageForTest(sessionId, session, parsed) {
+  return processDesktopMessage(sessionId, session, parsed);
+}
+
+/**
+ * Register a session object under an id so the test harness can exercise code
+ * paths that look the session up by id (sendToPhone, cleanup).
+ */
+export function __registerSessionForTest(sessionId, session) {
+  rcSessions.set(sessionId, session);
+}
+
+export function __endThinkingForTest(sessionId, session) {
+  return emitThinkingEnd(sessionId, session);
 }
 
 export function getActiveSessions() {
