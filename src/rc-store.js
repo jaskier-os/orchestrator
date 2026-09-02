@@ -1,5 +1,12 @@
 import { DEFAULT_ORCHESTRATOR_MODE } from './permission-mode.js';
 
+/**
+ * Most pending frames retained per session. Enough to cover a long stall's
+ * worth of tool completions and turn text, bounded so a phone that never comes
+ * back cannot grow the document without limit.
+ */
+const PENDING_QUEUE_CAP = 200;
+
 export class RcStore {
   /**
    * @param {import('mongodb').Db} db
@@ -181,7 +188,19 @@ export class RcStore {
   async appendPendingQueue(sessionId, message) {
     const result = await this.collection.findOneAndUpdate(
       { sessionId },
-      { $push: { pendingQueue: { ts: new Date().toISOString(), message } }, $set: { updatedAt: new Date() } },
+      {
+        // Capped: entries are also appended on a SUCCESSFUL send now (a
+        // half-open socket accepts writes that never arrive), and a phone that
+        // stays away would otherwise grow this without limit. The newest 200
+        // are what a reconnecting phone can still act on.
+        $push: {
+          pendingQueue: {
+            $each: [{ ts: new Date().toISOString(), message }],
+            $slice: -PENDING_QUEUE_CAP,
+          },
+        },
+        $set: { updatedAt: new Date() },
+      },
       { returnDocument: 'after' }
     );
     return result;

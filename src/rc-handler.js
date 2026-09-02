@@ -453,6 +453,35 @@ function findPhoneWs() {
  * @param {string} sessionId
  * @param {Object} message
  */
+/**
+ * Whether losing this frame would leave the phone visibly wrong, and so it
+ * must survive a reconnect.
+ *
+ * The expensive failure is a terminal tool status: lose the `complete` and the
+ * row ticks forever on a tool that finished minutes ago. Losing one `running`
+ * heartbeat costs nothing -- another follows in 2s -- and queueing every one
+ * would make the replay huge for no benefit. Streaming text partials are
+ * likewise self-superseding.
+ * @param {Object} message
+ */
+function isReplayableOnReconnect(message) {
+  if (!message || typeof message !== 'object') return false;
+  switch (message.type) {
+    case MSG_TYPE.RC_TOOL_STATUS:
+      // Only the terminal states; heartbeats are replaced within seconds.
+      return message.status === 'complete' || message.status === 'error';
+    case MSG_TYPE.RC_PERMISSION_REQUEST:
+    case MSG_TYPE.RC_ERROR:
+    case MSG_TYPE.RC_SESSION_END:
+      return true;
+    case MSG_TYPE.RC_MESSAGE:
+      // Only the settled turn text; partials are cumulative snapshots.
+      return message.isFinal === true;
+    default:
+      return false;
+  }
+}
+
 async function sendToPhone(sessionId, message, persist = true) {
   const session = rcSessions.get(sessionId);
   const targetDeviceId = session?.phoneDeviceId;
@@ -469,6 +498,17 @@ async function sendToPhone(sessionId, message, persist = true) {
     try {
       const payload = serializeMessage(message).replace(/\0/g, '');
       phone.ws.send(payload);
+      // readyState === 1 does NOT mean the peer received this. A half-open
+      // socket -- open to us, already gone from the phone's side -- accepts
+      // writes silently, and every frame written to it is lost with no error
+      // anywhere. Frames whose loss the user would actually notice are
+      // therefore ALSO queued, and cleared only when the phone acknowledges
+      // them on reconnect. Streaming partials are excluded: they are
+      // superseded by the next one anyway, so queueing them would just make
+      // the reconnect replay enormous.
+      if (isReplayableOnReconnect(message)) {
+        await rcStore.appendPendingQueue(sessionId, message).catch(() => {});
+      }
     } catch (err) {
       console.error(`[rc-handler] Failed to send to phone: ${err.message}`);
       await rcStore.appendPendingQueue(sessionId, message).catch(() => {});
@@ -2442,11 +2482,31 @@ export async function notifyPhoneReconnect(deviceId, ws) {
     }
     console.log(`[rc-handler] Phone reconnected for session ${sessionId}`);
 
-    // Drain pending queue (just clear it -- transcript already contains these messages)
+    // Replay the pending queue. This used to be cleared on the grounds that
+    // the transcript covers it, which is not true for the frames that matter
+    // most: a tool's `complete` written into a half-open socket is lost, and
+    // the transcript catch-up races the live turn, so the phone can be left
+    // ticking forever on a tool that finished while it was disconnected.
+    //
+    // Replaying is safe because every rc_tool_status carries a monotonic per
+    // tool seq and the phone drops anything it has already applied.
     try {
       const queued = await rcStore.drainPendingQueue(sessionId);
+      let replayed = 0;
+      for (const item of queued) {
+        const msg = item?.message;
+        if (!msg) continue;
+        if (ws.readyState !== 1) break;
+        try {
+          ws.send(serializeMessage(msg).replace(/\0/g, ''));
+          replayed++;
+        } catch (err) {
+          console.error(`[rc-handler] Replay failed for session ${sessionId}: ${err.message}`);
+          break;
+        }
+      }
       if (queued.length > 0) {
-        console.log(`[rc-handler] Cleared ${queued.length} queued messages for session ${sessionId} (covered by transcript)`);
+        console.log(`[rc-handler] Replayed ${replayed}/${queued.length} queued messages for session ${sessionId}`);
       }
     } catch (err) {
       console.error(`[rc-handler] Failed to drain pending queue: ${err.message}`);
