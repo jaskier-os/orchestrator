@@ -552,6 +552,14 @@ function stampToolSeq(session, msg) {
   const next = (session.toolSeq.get(key) || 0) + 1;
   session.toolSeq.set(key, next);
   msg.seq = next;
+  // Every tool status the phone could receive is logged here, at the single
+  // point they all pass through, so the wire can be compared against what the
+  // phone rendered.
+  console.log(
+    `[rc-handler] rc_tool_status ${msg.toolName} status=${msg.status} ` +
+    `seq=${next} toolCallId=${msg.toolCallId || '-'}` +
+    (msg.elapsedMs != null ? ` elapsedMs=${msg.elapsedMs}` : ''),
+  );
   return msg;
 }
 
@@ -1477,6 +1485,12 @@ function processDesktopMessage(sessionId, session, parsed) {
       }
     }
     const blocks = Array.isArray(contentBlocks) ? contentBlocks : [contentBlocks];
+    // Block kinds are logged because a tool_use that never produces an
+    // rc_tool_status is otherwise indistinguishable from one that never
+    // arrived -- the two failures look identical from the phone.
+    console.log(`[rc-handler] assistant blocks: ${blocks
+      .map(b => (typeof b === 'string' ? 'string' : b?.type || 'unknown'))
+      .join(',')}`);
     const textParts = [];
     for (const block of blocks) {
       if (typeof block === 'string') {
