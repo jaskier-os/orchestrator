@@ -699,7 +699,7 @@ function handleDeviceConnection(ws, request) {
 
     // WebSocket size test: sends back messages of increasing size
     if (envelope.type === 'ws_size_test') {
-      const sizes = [1000, 5000, 10000, 20000, 30000, 50000, 64000];
+      const sizes = [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000];
       for (const size of sizes) {
         const currentWs = deviceConnections.get(deviceId) || ws;
         if (currentWs.readyState !== 1) break;
