@@ -1525,12 +1525,15 @@ function processDesktopMessage(sessionId, session, parsed) {
       }
     }
     const blocks = Array.isArray(contentBlocks) ? contentBlocks : [contentBlocks];
-    // Block kinds are logged because a tool_use that never produces an
+    // Only tool-bearing frames are logged. A tool_use that never produces an
     // rc_tool_status is otherwise indistinguishable from one that never
-    // arrived -- the two failures look identical from the phone.
-    console.log(`[rc-handler] assistant blocks: ${blocks
-      .map(b => (typeof b === 'string' ? 'string' : b?.type || 'unknown'))
-      .join(',')}`);
+    // arrived -- the two look identical from the phone -- but logging every
+    // text frame too buried that signal in streaming chatter.
+    if (blocks.some(b => b && typeof b === 'object' && b.type === 'tool_use')) {
+      console.log(`[rc-handler] assistant blocks: ${blocks
+        .map(b => (typeof b === 'string' ? 'string' : b?.type || 'unknown'))
+        .join(',')}`);
+    }
     const textParts = [];
     for (const block of blocks) {
       if (typeof block === 'string') {
