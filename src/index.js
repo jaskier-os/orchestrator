@@ -133,6 +133,47 @@ function readRequestBody(req, cb) {
 
 const wss = new WebSocketServer({ noServer: true });
 
+/**
+ * Reap WebSockets whose peer is gone.
+ *
+ * The `ws` library does NOT do this: a client that vanishes without a clean
+ * close (phone loses its network, NAT drops the mapping, process killed)
+ * leaves a socket the server considers ESTABLISHED forever. Measured on the
+ * live server: ONE phone had accumulated 150 established connections while the
+ * phone itself held 9, most of them stuck in FIN-WAIT-1 -- its FINs were never
+ * acknowledged because nothing on this side was reading them.
+ *
+ * The standard pattern: ping every peer on an interval and terminate anything
+ * that did not answer the previous round. Sockets carrying real traffic answer
+ * automatically, so this only ever kills genuinely dead ones.
+ */
+const WS_LIVENESS_INTERVAL_MS = 30000;
+
+const wsLivenessInterval = setInterval(() => {
+  for (const ws of wss.clients) {
+    if (ws.isAlive === false) {
+      const label = ws._deviceId || ws._deviceType || 'unidentified';
+      console.log(`[server] Terminating unresponsive WS (${label})`);
+      try { ws.terminate(); } catch { /* already gone */ }
+      continue;
+    }
+    ws.isAlive = false;
+    try { ws.ping(); } catch { /* write on a dying socket */ }
+  }
+}, WS_LIVENESS_INTERVAL_MS);
+wsLivenessInterval.unref();
+
+/**
+ * Arm liveness tracking on a socket. Called from every handleUpgrade callback:
+ * with `noServer: true` the server never emits 'connection', so this cannot be
+ * registered in one place.
+ * @param {import('ws').WebSocket} ws
+ */
+function trackWsLiveness(ws) {
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+}
+
 // Device WebSocket connections: deviceId -> ws
 const deviceConnections = new Map();
 
@@ -383,27 +424,33 @@ server.on('upgrade', (request, socket, head) => {
 
   if (url.pathname === '/ws/device') {
     wss.handleUpgrade(request, socket, head, (ws) => {
+      trackWsLiveness(ws);
       handleDeviceConnection(ws, request);
     });
   } else if (url.pathname === '/ws/transcribe') {
     wss.handleUpgrade(request, socket, head, (ws) => {
+      trackWsLiveness(ws);
       handleTranscribeConnection(ws);
     });
   } else if (url.pathname === '/ws/transcriber') {
     wss.handleUpgrade(request, socket, head, (ws) => {
+      trackWsLiveness(ws);
       handleTranscriberServiceConnection(ws);
     });
   } else if (url.pathname.startsWith('/ws/stream/')) {
     wss.handleUpgrade(request, socket, head, (ws) => {
+      trackWsLiveness(ws);
       handleStreamConnection(ws, url);
     });
   } else if (url.pathname === '/ws/remote-control') {
     wss.handleUpgrade(request, socket, head, (ws) => {
+      trackWsLiveness(ws);
       handleRemoteControlConnection(ws, request);
     });
   } else {
     // Default: agent connection
     wss.handleUpgrade(request, socket, head, (ws) => {
+      trackWsLiveness(ws);
       handleAgentConnection(ws);
     });
   }
