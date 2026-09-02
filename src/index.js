@@ -679,11 +679,20 @@ function handleDeviceConnection(ws, request) {
       }
     }
 
-    // Health ping from device -- respond with pong so device can detect stale connections
+    // Health ping from device -- respond with pong so it can detect a stale
+    // connection. The reply MUST go back on the socket the ping arrived on,
+    // not on whatever is currently registered for this deviceId: a phone that
+    // reconnects (or a second client using the same id) replaces that entry,
+    // and answering there leaves the asking socket waiting forever. It then
+    // declares itself half-open and reconnects, which replaces the entry
+    // again -- a loop that reads as "the network keeps dropping".
     if (envelope.type === 'health' && envelope.status === 'ping') {
-      const currentWs = deviceConnections.get(deviceId) || ws;
-      if (currentWs.readyState === 1) {
-        currentWs.send(serializeMessage({ type: 'health', status: 'pong' }));
+      const registered = deviceConnections.get(deviceId);
+      if (registered && registered !== ws) {
+        console.log(`[server] health ping from ${deviceId} on a non-registered socket -- replying on the asking socket`);
+      }
+      if (ws.readyState === 1) {
+        ws.send(serializeMessage({ type: 'health', status: 'pong' }));
       }
       return;
     }
