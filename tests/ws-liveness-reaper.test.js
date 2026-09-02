@@ -39,15 +39,19 @@ function fakeClient({ answersPings, label }) {
     },
     terminate() { this.terminated = true; },
   };
-  c.on('pong', () => { c.isAlive = true; });
+  c._lastSeenAt = 0; // treated as long-idle unless a test says otherwise
+  c.on('pong', () => { c.isAlive = true; c._lastSeenAt = Date.now(); });
   return c;
 }
 
+const INTERVAL_MS = 30000;
+
 /** The reaper, mirroring the interval body in src/index.js. */
-function reapRound(clients) {
+function reapRound(clients, now = Date.now()) {
   const terminated = [];
   for (const ws of clients) {
-    if (ws.isAlive === false) {
+    const idle = now - (ws._lastSeenAt ?? now);
+    if (ws.isAlive === false && idle > INTERVAL_MS) {
       ws.terminate();
       terminated.push(ws.label);
       continue;
@@ -76,6 +80,32 @@ function testDeadPeerIsReaped() {
   check('the silent peer is terminated', killed.join() === 'dead', killed.join(','));
   check('the answering peer survives', live.terminated === false);
   check('and keeps being pinged', live.pings === 2);
+}
+
+function testMessagesCountAsLiveness() {
+  console.log('\na client that sends messages but never pongs is NOT terminated');
+  // THE REGRESSION. The phone answers no protocol pings at all (pongs=0) while
+  // sending an application health frame every 5s. Treating only pongs as proof
+  // of life terminated its healthy socket every ~40s; the phone reconnected,
+  // and that loop looked exactly like the network fault being hunted.
+  const chatty = fakeClient({ answersPings: false, label: 'chatty' });
+  let now = 1_000_000;
+  chatty._lastSeenAt = now;
+
+  for (let round = 0; round < 5; round++) {
+    now += INTERVAL_MS;
+    // A message arrives between sweeps, as the phone's 5s health frame does.
+    chatty._lastSeenAt = now - 5000;
+    const killed = reapRound([chatty], now);
+    check(`round ${round + 1}: survived on message traffic alone`,
+      killed.length === 0 && chatty.terminated === false);
+  }
+
+  // Genuinely silent now: no messages, no pongs, longer than one interval.
+  now += INTERVAL_MS * 2;
+  const killed = reapRound([chatty], now);
+  check('but IS terminated once it goes truly silent', killed.join() === 'chatty',
+    killed.join(','));
 }
 
 function testHealthyPeerSurvivesManyRounds() {
@@ -120,7 +150,11 @@ function testWiredIntoEveryUpgrade() {
   const armed = (src.match(/trackWsLiveness\(ws\);/g) || []).length;
   check('every handleUpgrade arms liveness', upgrades > 0 && armed === upgrades,
     `${armed} armed vs ${upgrades} upgrade paths`);
-  check('the sweep interval exists', /setInterval\([\s\S]{0,900}?ws\.terminate\(\)/.test(src));
+  check('the sweep interval exists', /setInterval\([\s\S]{0,1600}?ws\.terminate\(\)/.test(src));
+  // Any traffic must count as liveness, not pongs alone: the phone returns no
+  // pongs at all and would otherwise be reaped every interval.
+  check('message traffic counts as liveness',
+    /_lastSeenAt/.test(src) && /on\('message'/.test(src));
   // A socket that connects moments before a sweep must not be pinged and then
   // killed on the very next tick -- that terminated healthy phones 7s after
   // they connected.
@@ -134,6 +168,7 @@ import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 
 testDeadPeerIsReaped();
+testMessagesCountAsLiveness();
 testHealthyPeerSurvivesManyRounds();
 testTerminateThrowIsContained();
 testWiredIntoEveryUpgrade();
