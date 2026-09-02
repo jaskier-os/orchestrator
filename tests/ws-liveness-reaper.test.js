@@ -120,7 +120,12 @@ function testWiredIntoEveryUpgrade() {
   const armed = (src.match(/trackWsLiveness\(ws\);/g) || []).length;
   check('every handleUpgrade arms liveness', upgrades > 0 && armed === upgrades,
     `${armed} armed vs ${upgrades} upgrade paths`);
-  check('the sweep interval exists', /setInterval\([\s\S]{0,400}?ws\.terminate\(\)/.test(src));
+  check('the sweep interval exists', /setInterval\([\s\S]{0,900}?ws\.terminate\(\)/.test(src));
+  // A socket that connects moments before a sweep must not be pinged and then
+  // killed on the very next tick -- that terminated healthy phones 7s after
+  // they connected.
+  check('new sockets get a full interval before they can be reaped',
+    /_connectedAt/.test(src) && /age < WS_LIVENESS_INTERVAL_MS/.test(src));
   check('the interval is unref\'d so it cannot hold the process open',
     /wsLivenessInterval\.unref\(\)/.test(src));
 }

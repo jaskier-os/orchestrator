@@ -150,10 +150,17 @@ const wss = new WebSocketServer({ noServer: true });
 const WS_LIVENESS_INTERVAL_MS = 30000;
 
 const wsLivenessInterval = setInterval(() => {
+  const now = Date.now();
   for (const ws of wss.clients) {
+    const label = ws._deviceId || ws._deviceType || 'unidentified';
+    // Give every socket a full interval to answer its FIRST ping. A socket
+    // that connected moments before a sweep would otherwise be pinged and
+    // then killed on the next tick without ever having had a fair chance --
+    // which showed up as healthy phones being terminated 7s after connecting.
+    const age = now - (ws._connectedAt || now);
+    if (age < WS_LIVENESS_INTERVAL_MS) continue;
     if (ws.isAlive === false) {
-      const label = ws._deviceId || ws._deviceType || 'unidentified';
-      console.log(`[server] Terminating unresponsive WS (${label})`);
+      console.log(`[server] Terminating unresponsive WS (${label}, age=${Math.round(age / 1000)}s, pongs=${ws._pongCount || 0})`);
       try { ws.terminate(); } catch { /* already gone */ }
       continue;
     }
@@ -171,7 +178,12 @@ wsLivenessInterval.unref();
  */
 function trackWsLiveness(ws) {
   ws.isAlive = true;
-  ws.on('pong', () => { ws.isAlive = true; });
+  ws._connectedAt = Date.now();
+  ws._pongCount = 0;
+  ws.on('pong', () => {
+    ws.isAlive = true;
+    ws._pongCount = (ws._pongCount || 0) + 1;
+  });
 }
 
 // Device WebSocket connections: deviceId -> ws
