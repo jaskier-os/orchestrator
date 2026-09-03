@@ -228,6 +228,31 @@ async function respawnCli(sessionId, workDir, cliPermissionMode) {
   }
 }
 
+// Adopt CLI callback: ask pc-agent to ATTACH to an interactive CLI the user
+// already has open for this session, WITHOUT ever spawning a new one. Triggered
+// when the phone opens a chat whose CLI is running on the PC but that the
+// orchestrator has never seen (started at the terminal, not via the phone).
+// Returns true only when an attach actually happened, so the caller can tell
+// the phone the session went live.
+async function adoptCli(sessionId, workDir, cliPermissionMode) {
+  const agentEntry = getAgent('pc-agent');
+  if (!agentEntry) return false;
+  const wsUrl = `wss://placeholder/ws/remote-control?session=${sessionId}`;
+  const response = await sendDirectAgentRequest(agentEntry, {
+    requestId: crypto.randomUUID(),
+    action: 'remote_session_adopt',
+    workDir,
+    sessionId,
+    wsUrl,
+    apiKey: config.apiKey,
+    permissionMode: cliPermissionMode
+  }, 30000);
+  if (response.status === 'error') {
+    throw new Error(response.text || 'remote_session_adopt failed');
+  }
+  return response.data?.adopted === true;
+}
+
 // Kill CLI callback: ask pc-agent to SIGTERM/SIGKILL the actual CLI process
 // for a session so it can't reconnect after endSession() closes the WS.
 async function killCli(sessionId) {
@@ -284,6 +309,7 @@ async function exportJsonl(workDir, sessionId, opts = {}) {
 initRcHandler(rcStore, deviceConnections, {
   sessionTimeoutMs: config.rcSessionTimeoutMs,
   respawnCli,
+  adoptCli,
   killCli,
   exportJsonl
 });

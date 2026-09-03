@@ -96,6 +96,13 @@ const RC_DESKTOP_PING_INTERVAL_MS = 30_000;
 /** @type {((sessionId: string, workDir: string, permissionMode: string) => Promise<void>)|null} */
 let respawnCliFn = null;
 
+// Adopt CLI callback (set by initRcHandler). Attaches to an interactive CLI the
+// user already has open for a session WITHOUT spawning one. Unlike respawnCliFn
+// it never starts a process, so it is safe to fire merely on chat-open. Resolves
+// true when an attach actually happened.
+/** @type {((sessionId: string, workDir: string, permissionMode: string) => Promise<boolean>)|null} */
+let adoptCliFn = null;
+
 // Kill CLI callback (set by initRcHandler). Called by endSession() to
 // SIGTERM/SIGKILL the actual CLI process on the PC so it doesn't reconnect.
 /** @type {((sessionId: string) => Promise<void>)|null} */
@@ -411,6 +418,14 @@ export async function buildMergedTranscriptPage(sessionId, workDir, opts) {
 /** @type {Map<string, { promise: Promise<void>, timer: NodeJS.Timeout }>} */
 const inFlightRespawns = new Map();
 
+// Dedup in-flight adopt attempts. A phone reopening the same chat repeatedly
+// (onResume re-fires the transcript request) must not stack attach calls at
+// pc-agent. Cleared when the desktop WS connects (session enters rcSessions via
+// clearRespawnGuard, which also clears this) or after a short ceiling.
+/** @type {Set<string>} */
+const inFlightAdopts = new Set();
+const ADOPT_CEILING_MS = 30_000;
+
 /**
  * Initialize RC handler with dependencies.
  * @param {import('./rc-store.js').RcStore} store
@@ -426,13 +441,16 @@ export function initRcHandler(store, connections, options) {
   if (options?.respawnCli) {
     respawnCliFn = options.respawnCli;
   }
+  if (options?.adoptCli) {
+    adoptCliFn = options.adoptCli;
+  }
   if (options?.killCli) {
     killCliFn = options.killCli;
   }
   if (options?.exportJsonl) {
     exportJsonlFn = options.exportJsonl;
   }
-  console.log(`[rc-handler] Initialized (sessionTimeout=${SESSION_TIMEOUT_MS}ms, respawnCli=${!!respawnCliFn}, killCli=${!!killCliFn}, exportJsonl=${!!exportJsonlFn})`);
+  console.log(`[rc-handler] Initialized (sessionTimeout=${SESSION_TIMEOUT_MS}ms, respawnCli=${!!respawnCliFn}, adoptCli=${!!adoptCliFn}, killCli=${!!killCliFn}, exportJsonl=${!!exportJsonlFn})`);
 }
 
 /**
@@ -1935,6 +1953,10 @@ export function handleRcPhoneMessage(deviceId, envelope, ws) {
         console.error(`[rc-handler] Failed to send transcript for ended session: ${err.message}`);
       }
     })();
+    // Adopt-only: if the user has this conversation open in an interactive CLI
+    // on the PC, attach to it so the phone shows it live. Never spawns; a no-op
+    // when nothing is running. Independent of the transcript send above.
+    maybeAdoptCli(endedSessionId);
     return;
   }
 
@@ -2368,10 +2390,61 @@ function maybeRespawnCli(sessionId) {
 
 /** Clear the in-flight respawn dedup guard for a session. */
 function clearRespawnGuard(sessionId) {
+  // The adopt guard shares the "desktop WS is now connected" clear point: once
+  // the CLI attaches the session enters rcSessions and neither guard is needed.
+  inFlightAdopts.delete(sessionId);
   const entry = inFlightRespawns.get(sessionId);
   if (!entry) return;
   clearTimeout(entry.timer);
   inFlightRespawns.delete(sessionId);
+}
+
+/**
+ * Adopt-only reconciliation: if the user has an interactive CLI open for this
+ * session on the PC (started at the terminal, so the orchestrator never saw
+ * it), ask pc-agent to attach to it. NEVER spawns -- opening an old chat must
+ * not start a CLI. Fires on chat-open (transcript request) so the phone shows
+ * the session as live without the user having to send a message first.
+ *
+ * Guarded so a phone re-requesting the transcript cannot stack attach calls.
+ * On a successful adopt the desktop WS connects and clears the guard; on no-op
+ * or failure the guard is cleared here.
+ */
+function maybeAdoptCli(sessionId) {
+  if (!adoptCliFn) return;
+  if (rcSessions.has(sessionId)) return;
+  if (inFlightRespawns.has(sessionId)) return;
+  if (inFlightAdopts.has(sessionId)) return;
+  inFlightAdopts.add(sessionId);
+  const ceiling = setTimeout(() => inFlightAdopts.delete(sessionId), ADOPT_CEILING_MS);
+  ceiling.unref?.();
+  (async () => {
+    let adopted = false;
+    try {
+      const stored = await rcStore.get(sessionId).catch(() => null);
+      if (!stored || !stored.workDir) return;
+      // Only adopt a session the store still considers active. An ended row
+      // means the user deliberately terminated it; reviving is the respawn
+      // path's job, driven by an actual message, not by merely opening a chat.
+      if (stored.status !== 'active') return;
+      const mode = toCliMode(stored.permissionMode || DEFAULT_ORCHESTRATOR_MODE);
+      adopted = await adoptCliFn(sessionId, stored.workDir, mode);
+      console.log(`[rc-handler] Adopt-on-open for ${sessionId}: adopted=${adopted}`);
+    } catch (err) {
+      console.log(`[rc-handler] Adopt-on-open for ${sessionId} failed: ${err.message}`);
+    } finally {
+      // On a successful adopt the desktop WS connects a moment later and
+      // clearRespawnGuard removes the guard. Holding it until then stops a
+      // rapid second transcript request (phone onResume) from firing a
+      // redundant adopt round-trip in that window; the ceiling stays armed as
+      // the backstop so the guard cannot leak if the WS never arrives.
+      // On no-op/failure nothing else will clear it, so drop it now.
+      if (!adopted) {
+        clearTimeout(ceiling);
+        inFlightAdopts.delete(sessionId);
+      }
+    }
+  })();
 }
 
 /**
