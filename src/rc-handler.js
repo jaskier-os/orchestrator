@@ -1955,8 +1955,10 @@ export function handleRcPhoneMessage(deviceId, envelope, ws) {
     })();
     // Adopt-only: if the user has this conversation open in an interactive CLI
     // on the PC, attach to it so the phone shows it live. Never spawns; a no-op
-    // when nothing is running. Independent of the transcript send above.
-    maybeAdoptCli(endedSessionId);
+    // when nothing is running. Independent of the transcript send above. The ws
+    // is passed so that, once adopt resolves a workDir the store never had, the
+    // catch-up transcript can be pushed to this same phone.
+    maybeAdoptCli(endedSessionId, ws);
     return;
   }
 
@@ -2410,7 +2412,7 @@ function clearRespawnGuard(sessionId) {
  * On a successful adopt the desktop WS connects and clears the guard; on no-op
  * or failure the guard is cleared here.
  */
-function maybeAdoptCli(sessionId) {
+function maybeAdoptCli(sessionId, requestingWs = null) {
   if (!adoptCliFn) return;
   if (rcSessions.has(sessionId)) return;
   if (inFlightRespawns.has(sessionId)) return;
@@ -2432,8 +2434,34 @@ function maybeAdoptCli(sessionId) {
       if (stored && stored.status && stored.status !== 'active') return;
       const workDir = stored?.workDir || null;
       const mode = toCliMode(stored?.permissionMode || DEFAULT_ORCHESTRATOR_MODE);
-      adopted = await adoptCliFn(sessionId, workDir, mode);
-      console.log(`[rc-handler] Adopt-on-open for ${sessionId}: adopted=${adopted} (workDir=${workDir || 'from-registry'})`);
+      const result = await adoptCliFn(sessionId, workDir, mode);
+      adopted = result?.adopted === true;
+      // A terminal-started session has no store row, so the desktop-connect path
+      // (which recovers workDir only from the store) would send workDir=null to
+      // the phone and could not export history. Persist the pc-agent-resolved
+      // workDir now so both the folder chip and the JSONL transcript work.
+      const resolvedWorkDir = result?.workDir || workDir;
+      if (adopted && resolvedWorkDir && !stored) {
+        await rcStore.create(sessionId, resolvedWorkDir, mode).catch(err =>
+          console.log(`[rc-handler] Could not persist adopted session ${sessionId}: ${err.message}`));
+        // The first transcript request (which triggered this adopt) returned
+        // empty: with no store row there was no workDir to export the JSONL
+        // spine from. Now that the workDir is known, send the catch-up
+        // transcript so the phone shows the existing history without the user
+        // reopening the chat.
+        if (requestingWs && requestingWs.readyState === 1) {
+          try {
+            const transcript = await buildCatchUpTranscript(sessionId, resolvedWorkDir);
+            if (transcript.length > 0) {
+              const catchUpMsg = createRcTranscriptMessage(sessionId, transcript);
+              requestingWs.send(serializeMessage(catchUpMsg).replace(/\0/g, ''));
+            }
+          } catch (err) {
+            console.log(`[rc-handler] Adopt catch-up transcript failed for ${sessionId}: ${err.message}`);
+          }
+        }
+      }
+      console.log(`[rc-handler] Adopt-on-open for ${sessionId}: adopted=${adopted} (workDir=${resolvedWorkDir || 'unresolved'})`);
     } catch (err) {
       console.log(`[rc-handler] Adopt-on-open for ${sessionId} failed: ${err.message}`);
     } finally {

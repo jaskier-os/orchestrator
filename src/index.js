@@ -250,7 +250,13 @@ async function adoptCli(sessionId, workDir, cliPermissionMode) {
   if (response.status === 'error') {
     throw new Error(response.text || 'remote_session_adopt failed');
   }
-  return response.data?.adopted === true;
+  // Return the pc-agent-resolved workDir too: for a terminal-started session
+  // the orchestrator had none, and it needs it to persist a store row so the
+  // transcript (JSONL export) path can serve history.
+  return {
+    adopted: response.data?.adopted === true,
+    workDir: response.data?.workDir || null,
+  };
 }
 
 // Kill CLI callback: ask pc-agent to SIGTERM/SIGKILL the actual CLI process
