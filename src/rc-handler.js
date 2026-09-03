@@ -2421,15 +2421,19 @@ function maybeAdoptCli(sessionId) {
   (async () => {
     let adopted = false;
     try {
+      // A session the user started at the terminal has NO store row at all --
+      // that is the whole point of this path. So a missing row is NOT a reason
+      // to bail: fall back to a null workDir and let pc-agent resolve the CLI's
+      // real cwd from its own live-session registry by sessionId.
       const stored = await rcStore.get(sessionId).catch(() => null);
-      if (!stored || !stored.workDir) return;
-      // Only adopt a session the store still considers active. An ended row
-      // means the user deliberately terminated it; reviving is the respawn
-      // path's job, driven by an actual message, not by merely opening a chat.
-      if (stored.status !== 'active') return;
-      const mode = toCliMode(stored.permissionMode || DEFAULT_ORCHESTRATOR_MODE);
-      adopted = await adoptCliFn(sessionId, stored.workDir, mode);
-      console.log(`[rc-handler] Adopt-on-open for ${sessionId}: adopted=${adopted}`);
+      // Only skip when the store KNOWS this session and considers it ended: the
+      // user deliberately terminated it, and reviving is the respawn path's job
+      // (driven by a real message), not something a mere chat-open should do.
+      if (stored && stored.status && stored.status !== 'active') return;
+      const workDir = stored?.workDir || null;
+      const mode = toCliMode(stored?.permissionMode || DEFAULT_ORCHESTRATOR_MODE);
+      adopted = await adoptCliFn(sessionId, workDir, mode);
+      console.log(`[rc-handler] Adopt-on-open for ${sessionId}: adopted=${adopted} (workDir=${workDir || 'from-registry'})`);
     } catch (err) {
       console.log(`[rc-handler] Adopt-on-open for ${sessionId} failed: ${err.message}`);
     } finally {
