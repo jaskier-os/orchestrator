@@ -672,6 +672,40 @@ function emitToolHeartbeats(sessionId, session) {
 }
 
 /**
+ * Replay the current in-flight tools to ONE freshly-(re)connected phone ws, so
+ * a phone that opens a chat mid-turn sees the running-tool rows immediately
+ * instead of waiting for the next 2s heartbeat (or, for a fast turn, never).
+ * Unlike emitToolHeartbeats this targets a single socket rather than the whole
+ * device set, and it does NOT gate on elapsed time -- a just-started tool must
+ * still show as running the moment the phone attaches.
+ * @param {string} sessionId
+ * @param {Object} session
+ * @param {import('ws').WebSocket} ws
+ */
+function replayInFlightTools(sessionId, session, ws) {
+  if (!session.toolInFlight || session.toolInFlight.size === 0) return;
+  if (!ws || ws.readyState !== 1) return;
+  const now = Date.now();
+  for (const [toolCallId, entry] of session.toolInFlight) {
+    const hb = stampToolSeq(session, createRcToolStatusMessage(
+      sessionId, entry.toolName, 'running', entry.input || null, null, toolCallId
+    ));
+    hb.elapsedMs = now - entry.startedAt;
+    const meta = session.agentMeta ? session.agentMeta.get(toolCallId) : null;
+    if (meta) {
+      hb.isAgent = true;
+      if (meta.agentName) hb.agentName = meta.agentName;
+      if (meta.agentTask) hb.agentTask = meta.agentTask;
+      hb.agentElapsedMs = now - entry.startedAt;
+      if (meta.liveTokens != null) hb.agentTokens = meta.liveTokens;
+      if (meta.liveToolCount != null) hb.agentToolCount = meta.liveToolCount;
+    }
+    if (session.contextPct > 0) hb.contextPct = session.contextPct;
+    try { ws.send(serializeMessage(hb).replace(/\0/g, '')); } catch {}
+  }
+}
+
+/**
  * Record a tool as in-flight and arm the session heartbeat if it isn't running.
  * @param {string} sessionId
  * @param {Object} session
@@ -2244,6 +2278,9 @@ export function handleRcPhoneMessage(deviceId, envelope, ws) {
           try { ws.send(serializeMessage(thinkingMsg).replace(/\0/g, '')); } catch {}
         }
       }
+      // Re-emit running-tool rows so a phone that opened mid-turn sees the
+      // in-flight tools now, not on the next heartbeat.
+      replayInFlightTools(sessionId, session, ws);
     })();
     return;
   }
@@ -2687,6 +2724,9 @@ export async function notifyPhoneReconnect(deviceId, ws) {
         try { ws.send(serializeMessage(thinkingMsg).replace(/\0/g, '')); } catch {}
       }
     }
+    // Re-emit running-tool rows so a reconnecting phone (or one attaching to a
+    // session already mid-turn) sees the in-flight tools immediately.
+    replayInFlightTools(sessionId, session, ws);
   }
 }
 
