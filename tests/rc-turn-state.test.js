@@ -19,9 +19,7 @@ __registerSessionForTest('s-tool', { ...base(), toolInFlight: new Map([['t1', {}
 const by = Object.fromEntries(getActiveSessions().map(s => [s.sessionId, s]));
 check('idle session reports thinking=false', by['s-idle'].thinking === false);
 check('thinking session reports thinking=true', by['s-thinking'].thinking === true);
-check('thinking session carries its start time', by['s-thinking'].thinkingStartedAt === 1700000000000);
 check('a tool in flight counts as thinking', by['s-tool'].thinking === true);
-check('idle reports no start time', by['s-idle'].thinkingStartedAt === null);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

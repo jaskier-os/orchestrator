@@ -2807,10 +2807,7 @@ export function getActiveSessions() {
  */
 function turnStateOf(session) {
   const toolCount = session.toolInFlight ? session.toolInFlight.size : 0;
-  return {
-    thinking: !!session.thinkingStartedAt || toolCount > 0,
-    thinkingStartedAt: session.thinkingStartedAt || null
-  };
+  return { thinking: !!session.thinkingStartedAt || toolCount > 0 };
 }
 
 /**

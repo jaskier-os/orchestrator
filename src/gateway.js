@@ -475,7 +475,6 @@ app.use(async (ctx) => {
       // remainder of the list.
       for (const s of sessions) {
         s.thinking = false;
-        s.thinkingStartedAt = null;
       }
       try {
         const turnBySession = new Map(
@@ -485,7 +484,6 @@ app.use(async (ctx) => {
           const live = turnBySession.get(s.sessionId);
           if (!live) continue;
           s.thinking = live.thinking === true;
-          s.thinkingStartedAt = live.thinkingStartedAt;
         }
       } catch (e) {
         console.error('[gateway] Failed to enrich turn state:', e.message);
