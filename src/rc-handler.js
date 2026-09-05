@@ -2465,10 +2465,18 @@ function maybeAdoptCli(sessionId, requestingWs = null) {
       // to bail: fall back to a null workDir and let pc-agent resolve the CLI's
       // real cwd from its own live-session registry by sessionId.
       const stored = await rcStore.get(sessionId).catch(() => null);
-      // Only skip when the store KNOWS this session and considers it ended: the
-      // user deliberately terminated it, and reviving is the respawn path's job
-      // (driven by a real message), not something a mere chat-open should do.
-      if (stored && stored.status && stored.status !== 'active') return;
+      // Deliberately NOT gated on stored.status. A row reads "ended" whenever
+      // the desktop WS dropped -- which happens on every 1000 close, and the
+      // attached CLI treats 1000 as permanent and never reconnects. Refusing to
+      // adopt those left a running CLI with nothing mirroring it: the phone
+      // showed the chat as live but received no thinking state and no new
+      // messages, so the transcript silently fell behind the real session.
+      //
+      // Adopting is safe regardless of the stored status because pc-agent only
+      // ever attaches to a CLI that is actually alive right now; if the user
+      // really did terminate the session, there is no process to attach to and
+      // this is a no-op. Liveness on the PC is the authority here, not a status
+      // the store may have written minutes ago.
       const workDir = stored?.workDir || null;
       const mode = toCliMode(stored?.permissionMode || DEFAULT_ORCHESTRATOR_MODE);
       const result = await adoptCliFn(sessionId, workDir, mode);
