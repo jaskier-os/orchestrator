@@ -2789,10 +2789,29 @@ export function getActiveSessions() {
       phoneDeviceId: session.phoneDeviceId,
       permissionMode: session.permissionMode,
       createdAt: session.createdAt,
-      pendingPermissions: session.pendingPermissions.size
+      pendingPermissions: session.pendingPermissions.size,
+      ...turnStateOf(session)
     });
   }
   return result;
+}
+
+/**
+ * Whether a session is mid-turn right now, and since when.
+ *
+ * The phone learns "thinking" from live WS events, so a chat that was already
+ * running a turn before the app started listening shows no indicator at all.
+ * Exposing it on the REST surface lets the chat list recover that state on a
+ * cold open instead of waiting for the next event.
+ * @param {Object} session
+ */
+function turnStateOf(session) {
+  const toolCount = session.toolInFlight ? session.toolInFlight.size : 0;
+  return {
+    thinking: !!session.thinkingStartedAt || toolCount > 0,
+    thinkingStartedAt: session.thinkingStartedAt || null,
+    toolsInFlight: toolCount
+  };
 }
 
 /**

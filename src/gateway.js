@@ -11,7 +11,7 @@ import crypto from 'crypto';
 import { handleRequest } from './dispatcher.js';
 import * as registry from './registry.js';
 import { createRequestMessage, parseMessage, serializeMessage, MSG_TYPE } from '@orchestrator/sdk/protocol';
-import { endSession, buildMergedTranscript, buildMergedTranscriptPage } from './rc-handler.js';
+import { endSession, buildMergedTranscript, buildMergedTranscriptPage, getActiveSessions } from './rc-handler.js';
 import { DEFAULT_ORCHESTRATOR_MODE, validateOrchestratorMode, toCliMode } from './permission-mode.js';
 
 /** Devices that failed speaker verification -- next WS request gets rejection response. */
@@ -464,6 +464,23 @@ app.use(async (ctx) => {
         } catch (e) {
           console.error('[gateway] Failed to enrich session data:', e.message);
         }
+      }
+
+      // Enrich with live turn state. The phone learns "thinking" from WS events
+      // only, so a chat that was already mid-turn before the app started
+      // listening would show no indicator. This lets the list recover it on a
+      // cold open.
+      try {
+        const turnBySession = new Map(
+          getActiveSessions().map(a => [a.sessionId, a])
+        );
+        for (const s of sessions) {
+          const live = turnBySession.get(s.sessionId);
+          s.thinking = live ? live.thinking === true : false;
+          s.thinkingStartedAt = live ? live.thinkingStartedAt : null;
+        }
+      } catch (e) {
+        console.error('[gateway] Failed to enrich turn state:', e.message);
       }
 
       ctx.body = { sessions };
