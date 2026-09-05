@@ -470,14 +470,22 @@ app.use(async (ctx) => {
       // only, so a chat that was already mid-turn before the app started
       // listening would show no indicator. This lets the list recover it on a
       // cold open.
+      // Defaulted first: if the lookup below throws, every session still carries
+      // an explicit not-thinking rather than the field going missing on the
+      // remainder of the list.
+      for (const s of sessions) {
+        s.thinking = false;
+        s.thinkingStartedAt = null;
+      }
       try {
         const turnBySession = new Map(
           getActiveSessions().map(a => [a.sessionId, a])
         );
         for (const s of sessions) {
           const live = turnBySession.get(s.sessionId);
-          s.thinking = live ? live.thinking === true : false;
-          s.thinkingStartedAt = live ? live.thinkingStartedAt : null;
+          if (!live) continue;
+          s.thinking = live.thinking === true;
+          s.thinkingStartedAt = live.thinkingStartedAt;
         }
       } catch (e) {
         console.error('[gateway] Failed to enrich turn state:', e.message);
