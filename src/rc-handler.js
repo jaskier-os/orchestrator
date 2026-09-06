@@ -1436,6 +1436,36 @@ function processDesktopMessage(sessionId, session, parsed) {
     return;
   }
 
+  // The user answered a question/permission ON THE PC, so the attached CLI
+  // withdraws the prompt it forwarded to us. Without handling this the entry
+  // stayed in pendingPermissions and in the store, and every transcript
+  // request re-sent it to the phone as a LIVE prompt for a tool that had
+  // already run. pendingPermissions is keyed by toolUseId; the cancel carries
+  // the request_id, which each entry records.
+  if (type === 'control_cancel_request') {
+    const requestId = parsed.request_id;
+    for (const [toolUseId, pending] of session.pendingPermissions) {
+      if (pending.requestId !== requestId) continue;
+      clearTimeout(pending.timer);
+      session.pendingPermissions.delete(toolUseId);
+      // Settle the promise so the desktop-response path (and its store
+      // cleanup) runs. The CLI has already resolved locally; this response
+      // is ignored on its side, but the promise must not dangle.
+      pending.resolve({ approved: false, reason: 'answered on PC' });
+      rcStore.removePermission(sessionId, toolUseId).catch(() => {});
+      sendToPhone(sessionId, {
+        type: 'rc_permission_resolved',
+        sessionId,
+        requestId: toolUseId,
+        toolName: pending.toolName,
+        approved: null
+      });
+      console.log(`[rc-handler] Permission ${toolUseId} answered on PC; retired on phone`);
+      return;
+    }
+    return;
+  }
+
   // System messages (hooks, init) -- silently ignore
   if (type === 'system') {
     return;
