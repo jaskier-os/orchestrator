@@ -1,5 +1,18 @@
 import { ObjectId } from 'mongodb';
 
+export const TRACK_COLORS = ['red', 'green', 'yellow', 'blue', 'purple', 'aqua', 'orange', 'gray'];
+const DEFAULT_TRACK = { name: 'Other', color: 'gray' };
+
+function assertId(id, what) {
+  if (!id || !/^[0-9a-fA-F]{24}$/.test(id)) {
+    throw new Error(`Invalid ${what} id: "${id}" (expected 24-char hex string)`);
+  }
+}
+
+function escapeRegex(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+function withId(doc) { return { ...doc, id: doc._id.toString() }; }
+
 // Default tasks written once on a fresh install so the list is never empty on
 // first run. Order matters: index 0 ends up at the top (order 0, newest createdAt).
 const SEED_TASKS = [
@@ -19,6 +32,97 @@ export class TodoStore {
   constructor(db) {
     this.collection = db.collection('todos');
     this.metaCollection = db.collection('todos_meta');
+    this.tracks = db.collection('tracks');
+  }
+
+  /**
+   * Startup migration: guarantee at least one track exists and every todo
+   * belongs to one. Idempotent. Runs after ensureOrder().
+   */
+  async ensureTracks() {
+    if (await this.tracks.countDocuments({}) === 0) {
+      const now = new Date();
+      await this.tracks.insertOne({ ...DEFAULT_TRACK, order: 0, createdAt: now, updatedAt: now });
+      console.log('[todo-store] Created default track "Other"');
+    }
+    const def = await this.defaultTrack();
+    const res = await this.collection.updateMany(
+      { trackId: { $exists: false } },
+      { $set: { trackId: def.id } }
+    );
+    if (res.modifiedCount > 0) {
+      console.log(`[todo-store] Assigned ${res.modifiedCount} tasks to track "${def.name}"`);
+      await this.recompact(def.id);
+    }
+  }
+
+  /** The lowest-order track. */
+  async defaultTrack() {
+    const doc = await this.tracks.find().sort({ order: 1 }).limit(1).next();
+    if (!doc) throw new Error('No tracks exist; call ensureTracks() first');
+    return withId(doc);
+  }
+
+  async listTracks() {
+    const docs = await this.tracks.find().sort({ order: 1 }).toArray();
+    return docs.map(withId);
+  }
+
+  async findTrackByName(name) {
+    if (!name) return null;
+    const doc = await this.tracks.findOne({ name: { $regex: `^${escapeRegex(name.trim())}$`, $options: 'i' } });
+    return doc ? withId(doc) : null;
+  }
+
+  validateTrackFields({ name, color }, partial = false) {
+    const out = {};
+    if (name !== undefined || !partial) {
+      if (typeof name !== 'string' || !name.trim()) throw new Error('Track name must be a non-empty string');
+      out.name = name.trim();
+    }
+    if (color !== undefined || !partial) {
+      if (!TRACK_COLORS.includes(color)) throw new Error(`Track color must be one of: ${TRACK_COLORS.join(', ')}`);
+      out.color = color;
+    }
+    return out;
+  }
+
+  async createTrack(fields) {
+    const clean = this.validateTrackFields(fields);
+    const last = await this.tracks.find().sort({ order: -1 }).limit(1).next();
+    const now = new Date();
+    const doc = { ...clean, order: last ? last.order + 1 : 0, createdAt: now, updatedAt: now };
+    const r = await this.tracks.insertOne(doc);
+    return { ...doc, id: r.insertedId.toString() };
+  }
+
+  async updateTrack(id, fields) {
+    assertId(id, 'track');
+    const clean = this.validateTrackFields(fields, true);
+    const doc = await this.tracks.findOneAndUpdate(
+      { _id: new ObjectId(id) },
+      { $set: { ...clean, updatedAt: new Date() } },
+      { returnDocument: 'after' }
+    );
+    return doc ? withId(doc) : null;
+  }
+
+  async deleteTrack(id) {
+    assertId(id, 'track');
+    if (await this.tracks.countDocuments({}) <= 1) throw new Error('Cannot delete the last track');
+    const n = await this.collection.countDocuments({ trackId: id });
+    if (n > 0) throw new Error(`Track has tasks (${n}); move or delete them first`);
+    const r = await this.tracks.deleteOne({ _id: new ObjectId(id) });
+    return r.deletedCount === 1;
+  }
+
+  /** Rewrite order = 0..n-1 for one track, preserving current order. */
+  async recompact(trackId) {
+    const docs = await this.collection.find({ trackId }).sort({ order: 1, createdAt: -1 }).toArray();
+    if (docs.length === 0) return;
+    await this.collection.bulkWrite(docs.map((doc, i) => ({
+      updateOne: { filter: { _id: doc._id }, update: { $set: { order: i } } }
+    })));
   }
 
   /**
@@ -94,18 +198,23 @@ export class TodoStore {
   }
 
   /**
-   * Create a new todo at the top of the list (order 0).
+   * Create a new todo at the top (order 0) of its track. An unknown or missing
+   * trackId falls back to the default track.
    * @param {string} text
+   * @param {string} [trackId]
    * @returns {Promise<Object>} Created todo with string id
    */
-  async create(text) {
+  async create(text, trackId) {
+    if (trackId) assertId(trackId, 'track');
+    const track = trackId ? await this.tracks.findOne({ _id: new ObjectId(trackId) }) : null;
+    const resolvedTrackId = track ? track._id.toString() : (await this.defaultTrack()).id;
     const now = new Date();
-    // Push all existing tasks down by 1
-    await this.collection.updateMany({}, { $inc: { order: 1 } });
+    await this.collection.updateMany({ trackId: resolvedTrackId }, { $inc: { order: 1 } });
     const doc = {
       text,
       completed: false,
       priority: 'primary',
+      trackId: resolvedTrackId,
       order: 0,
       createdAt: now,
       updatedAt: now
@@ -115,16 +224,15 @@ export class TodoStore {
   }
 
   /**
-   * Update a todo by id.
+   * Update a todo by id. trackId is not updatable here; use move().
    * @param {string} id
    * @param {Object} fields - Fields to update (text, completed, priority)
    * @returns {Promise<Object|null>} Updated todo or null
    */
   async update(id, fields) {
-    if (!id || !/^[0-9a-fA-F]{24}$/.test(id)) {
-      throw new Error(`Invalid todo id: "${id}" (expected 24-char hex string)`);
-    }
-    const setFields = { ...fields, updatedAt: new Date() };
+    assertId(id, 'todo');
+    const { trackId: _ignored, order: _ignoredOrder, ...rest } = fields;
+    const setFields = { ...rest, updatedAt: new Date() };
     const result = await this.collection.findOneAndUpdate(
       { _id: new ObjectId(id) },
       { $set: setFields },
@@ -135,59 +243,44 @@ export class TodoStore {
   }
 
   /**
-   * Move a task to a new position in the list.
+   * Move a task to `position` within `trackId` (defaults to its current track).
+   * Cross-track moves recompact the source track too.
    * @param {string} id
-   * @param {number} position - Target 0-based index
+   * @param {number} position - Target 0-based index within the target track
+   * @param {string} [trackId]
    * @returns {Promise<Object>} Moved todo
    */
-  async move(id, position) {
-    if (!id || !/^[0-9a-fA-F]{24}$/.test(id)) {
-      throw new Error(`Invalid todo id: "${id}" (expected 24-char hex string)`);
+  async move(id, position, trackId) {
+    assertId(id, 'todo');
+    const current = await this.collection.findOne({ _id: new ObjectId(id) });
+    if (!current) throw new Error(`Task not found: ${id}`);
+    const targetTrackId = trackId || current.trackId;
+    if (trackId) {
+      assertId(trackId, 'track');
+      if (!(await this.tracks.findOne({ _id: new ObjectId(trackId) }))) throw new Error(`Track not found: ${trackId}`);
     }
-    const docs = await this.collection.find().sort({ order: 1 }).toArray();
-    if (docs.length === 0) throw new Error('No tasks to reorder');
-
-    const currentIndex = docs.findIndex(d => d._id.toString() === id);
-    if (currentIndex === -1) throw new Error(`Task not found: ${id}`);
-
-    const targetPos = Math.max(0, Math.min(position, docs.length - 1));
-    const [moved] = docs.splice(currentIndex, 1);
-    docs.splice(targetPos, 0, moved);
-
-    const bulk = docs.map((doc, i) => ({
-      updateOne: {
-        filter: { _id: doc._id },
-        update: { $set: { order: i, updatedAt: new Date() } }
-      }
-    }));
-    await this.collection.bulkWrite(bulk);
-
-    return { ...moved, id: moved._id.toString(), order: targetPos };
+    const docs = (await this.collection.find({ trackId: targetTrackId }).sort({ order: 1 }).toArray())
+      .filter(d => d._id.toString() !== id);
+    const targetPos = Math.max(0, Math.min(position, docs.length));
+    docs.splice(targetPos, 0, current);
+    const now = new Date();
+    await this.collection.bulkWrite(docs.map((doc, i) => ({
+      updateOne: { filter: { _id: doc._id }, update: { $set: { order: i, trackId: targetTrackId, updatedAt: now } } }
+    })));
+    if (targetTrackId !== current.trackId) await this.recompact(current.trackId);
+    return { ...current, id, trackId: targetTrackId, order: targetPos };
   }
 
   /**
-   * Remove a todo by id and recompact order values.
+   * Remove a todo by id and recompact its track's order values.
    * @param {string} id
    * @returns {Promise<boolean>}
    */
   async remove(id) {
-    if (!id || !/^[0-9a-fA-F]{24}$/.test(id)) {
-      throw new Error(`Invalid todo id: "${id}" (expected 24-char hex string)`);
-    }
-    const result = await this.collection.deleteOne({ _id: new ObjectId(id) });
-    if (result.deletedCount === 1) {
-      // Recompact order values
-      const docs = await this.collection.find().sort({ order: 1 }).toArray();
-      if (docs.length > 0) {
-        const bulk = docs.map((doc, i) => ({
-          updateOne: {
-            filter: { _id: doc._id },
-            update: { $set: { order: i } }
-          }
-        }));
-        await this.collection.bulkWrite(bulk);
-      }
-    }
-    return result.deletedCount === 1;
+    assertId(id, 'todo');
+    const doc = await this.collection.findOneAndDelete({ _id: new ObjectId(id) });
+    if (!doc) return false;
+    await this.recompact(doc.trackId);
+    return true;
   }
 }

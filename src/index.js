@@ -37,6 +37,7 @@ await connectDb(config.mongoUrl);
 const todoStore = new TodoStore(getDb());
 await todoStore.seedIfEmpty();
 await todoStore.ensureOrder();
+await todoStore.ensureTracks();
 
 const jobStore = new JobStore(getDb());
 

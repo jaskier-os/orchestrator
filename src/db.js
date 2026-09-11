@@ -19,6 +19,7 @@ export async function connectDb(url) {
     db = client.db(DB_NAME);
 
     await db.collection('todos').createIndex({ createdAt: -1 });
+    await db.collection('todos').createIndex({ trackId: 1, order: 1 });
     await db.collection('jobs').createIndex({ scheduledAt: 1, status: 1 });
     await db.collection('jobs').createIndex({ createdAt: -1 });
 
