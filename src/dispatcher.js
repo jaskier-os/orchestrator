@@ -698,6 +698,21 @@ function sendDeviceCommandAndWait(deviceWs, requestId, command, timeoutMs = DEFA
 }
 
 /**
+ * Resolve an AI-supplied track name (case-insensitive) to a track document.
+ * No name -> default track. Unknown name -> error listing the valid names.
+ * @param {string|undefined} name
+ */
+async function resolveTrack(name) {
+  if (!name) return todoStore.defaultTrack();
+  const track = await todoStore.findTrackByName(name);
+  if (!track) {
+    const names = (await todoStore.listTracks()).map(t => t.name).join(', ');
+    throw new Error(`Unknown track "${name}". Available tracks: ${names}`);
+  }
+  return track;
+}
+
+/**
  * Handle a todo tool call server-side via TodoStore.
  * Pushes updated list to device after mutations.
  * @param {string} toolName
@@ -705,16 +720,21 @@ function sendDeviceCommandAndWait(deviceWs, requestId, command, timeoutMs = DEFA
  * @param {import('ws').WebSocket|null} deviceWs
  * @returns {Promise<object>}
  */
-async function handleTodoTool(toolName, toolArgs, deviceWs) {
+export async function handleTodoTool(toolName, toolArgs, deviceWs) {
   if (toolName === 'list_tasks') {
-    const todos = await todoStore.list();
-    return { tasks: todos.map((t, i) => ({ id: t.id, text: t.text, completed: t.completed, position: i })) };
+    const [todos, tracks] = await Promise.all([todoStore.list(), todoStore.listTracks()]);
+    const nameById = Object.fromEntries(tracks.map(t => [t.id, t.name]));
+    return {
+      tracks: tracks.map(t => ({ name: t.name, color: t.color })),
+      tasks: todos.map(t => ({ id: t.id, text: t.text, completed: t.completed, track: nameById[t.trackId], position: t.order }))
+    };
   }
 
   if (toolName === 'add_task') {
-    const todo = await todoStore.create(toolArgs.text);
+    const track = await resolveTrack(toolArgs.track);
+    const todo = await todoStore.create(toolArgs.text, track.id);
     pushTodoUpdate(deviceWs);
-    return { created: { id: todo.id, text: todo.text, completed: todo.completed } };
+    return { created: { id: todo.id, text: todo.text, completed: todo.completed, track: track.name } };
   }
 
   if (toolName === 'update_task') {
@@ -729,9 +749,11 @@ async function handleTodoTool(toolName, toolArgs, deviceWs) {
   }
 
   if (toolName === 'move_task') {
-    const moved = await todoStore.move(toolArgs.id, toolArgs.position);
+    const track = toolArgs.track ? await resolveTrack(toolArgs.track) : null;
+    const moved = await todoStore.move(toolArgs.id, toolArgs.position, track ? track.id : undefined);
+    const trackName = track ? track.name : (await todoStore.listTracks()).find(t => t.id === moved.trackId)?.name;
     pushTodoUpdate(deviceWs);
-    return { moved: { id: moved.id, text: moved.text, position: moved.order } };
+    return { moved: { id: moved.id, text: moved.text, position: moved.order, track: trackName } };
   }
 
   if (toolName === 'delete_task') {
@@ -808,14 +830,18 @@ function pushJobUpdate(deviceWs) {
 }
 
 /**
- * Push the full todo list to the device so UI refreshes.
+ * Push the full todo list and the track list to the device so UI refreshes
+ * (per-track counts change with every todo mutation).
  * @param {import('ws').WebSocket|null} deviceWs
  */
 function pushTodoUpdate(deviceWs) {
   if (!deviceWs || deviceWs.readyState !== 1 || !todoStore) return;
-  todoStore.list().then(todos => {
+  Promise.all([todoStore.list(), todoStore.listTracks()]).then(([todos, tracks]) => {
     if (deviceWs.readyState !== 1) return;
-    try { deviceWs.send(serializeMessage({ type: MSG_TYPE.TODO_RESULT, action: 'list', todos })); } catch {}
+    try {
+      deviceWs.send(serializeMessage({ type: MSG_TYPE.TODO_RESULT, action: 'list', todos }));
+      deviceWs.send(serializeMessage({ type: MSG_TYPE.TRACK_RESULT, action: 'list', tracks }));
+    } catch {}
   }).catch(err => {
     console.error('[dispatcher] Failed to push todo update:', err.message);
   });

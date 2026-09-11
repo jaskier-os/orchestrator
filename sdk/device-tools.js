@@ -197,7 +197,7 @@ const TODO_TOOLS = [
     type: 'function',
     function: {
       name: 'list_tasks',
-      description: 'List all current tasks with their IDs, text, completion status, and position. Call this before update_task, move_task, or delete_task to get the task ID.',
+      description: 'List all tracks (categories) and all tasks with id, text, completion, track name and position within its track. Call before update_task, move_task, or delete_task to get the task ID.',
       parameters: { type: 'object', properties: {} }
     }
   },
@@ -205,13 +205,17 @@ const TODO_TOOLS = [
     type: 'function',
     function: {
       name: 'add_task',
-      description: 'Add a new task to the top of the user\'s task list.',
+      description: 'Add a new task to the top of a track.',
       parameters: {
         type: 'object',
         properties: {
           text: {
             type: 'string',
             description: 'The task text (e.g. "Buy groceries", "Call dentist")'
+          },
+          track: {
+            type: 'string',
+            description: 'Track (category) name to add the task to, e.g. "Work". Omit for the default track. Must match an existing track from list_tasks.'
           }
         },
         required: ['text']
@@ -247,7 +251,7 @@ const TODO_TOOLS = [
     type: 'function',
     function: {
       name: 'move_task',
-      description: 'Move a task to a different position in the list. Position 0 is the top. Call list_tasks first to see current positions.',
+      description: 'Move a task to a position within its track, or into another track (position is within the target track). Position 0 is the top. Call list_tasks first to see current positions.',
       parameters: {
         type: 'object',
         properties: {
@@ -257,7 +261,11 @@ const TODO_TOOLS = [
           },
           position: {
             type: 'number',
-            description: 'Target position (0-based index). 0 = top of list.'
+            description: 'Target position (0-based index) within the target track. 0 = top.'
+          },
+          track: {
+            type: 'string',
+            description: 'Track (category) name to move the task into, e.g. "Work". Omit to keep the current track. Must match an existing track from list_tasks.'
           }
         },
         required: ['id', 'position']
