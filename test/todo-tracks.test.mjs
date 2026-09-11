@@ -120,3 +120,16 @@ test('move rejects non-integer positions', async () => {
   await assert.rejects(() => store.move(a.id, -1), /Invalid position/);
   assert.equal((await store.list())[0].order, 0);
 });
+
+test('list orders by track order then position', async () => {
+  await store.ensureTracks();
+  const other = (await store.listTracks())[0];
+  const work = await store.createTrack({ name: 'Work', color: 'blue' });
+  const w1 = await store.create('w1', work.id);
+  const o1 = await store.create('o1', other.id);
+  const w2 = await store.create('w2', work.id);   // work: w2=0, w1=1
+  const o2 = await store.create('o2', other.id);  // other: o2=0, o1=1
+  await db.collection('todos').insertOne({ text: 'orphan', completed: false, priority: 'primary', trackId: 'ffffffffffffffffffffffff', order: 0, createdAt: new Date(), updatedAt: new Date() });
+  const texts = (await store.list()).map(t => t.text);
+  assert.deepEqual(texts, ['o2', 'o1', 'w2', 'w1', 'orphan']);
+});

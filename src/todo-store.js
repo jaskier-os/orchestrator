@@ -193,8 +193,17 @@ export class TodoStore {
    * @returns {Promise<Array>}
    */
   async list() {
-    const docs = await this.collection.find().sort({ order: 1 }).toArray();
-    return docs.map(doc => ({ ...doc, id: doc._id.toString() }));
+    const [docs, tracks] = await Promise.all([
+      this.collection.find().sort({ order: 1 }).toArray(),
+      this.tracks.find().sort({ order: 1 }).toArray()
+    ]);
+    // Group by track order first, then by position within the track.
+    // Todos whose trackId matches no track sort last (Mongo order kept as tiebreaker).
+    const rank = new Map(tracks.map((t, i) => [t._id.toString(), i]));
+    const unknown = tracks.length;
+    const rankOf = d => rank.has(d.trackId) ? rank.get(d.trackId) : unknown;
+    docs.sort((a, b) => rankOf(a) - rankOf(b) || a.order - b.order);
+    return docs.map(withId);
   }
 
   /**
