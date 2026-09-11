@@ -111,3 +111,12 @@ test('findTrackByName is case-insensitive', async () => {
   assert.equal((await store.findTrackByName('wOrK')).name, 'Work');
   assert.equal(await store.findTrackByName('nope'), null);
 });
+
+test('move rejects non-integer positions', async () => {
+  await store.ensureTracks();
+  const a = await store.create('a');
+  await assert.rejects(() => store.move(a.id, 'abc'), /Invalid position/);
+  await assert.rejects(() => store.move(a.id, undefined), /Invalid position/);
+  await assert.rejects(() => store.move(a.id, -1), /Invalid position/);
+  assert.equal((await store.list())[0].order, 0);
+});

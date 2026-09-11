@@ -252,6 +252,7 @@ export class TodoStore {
    */
   async move(id, position, trackId) {
     assertId(id, 'todo');
+    if (!Number.isInteger(position) || position < 0) throw new Error(`Invalid position: ${position}`);
     const current = await this.collection.findOne({ _id: new ObjectId(id) });
     if (!current) throw new Error(`Task not found: ${id}`);
     const targetTrackId = trackId || current.trackId;
