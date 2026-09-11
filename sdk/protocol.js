@@ -51,6 +51,12 @@ export const MSG_TYPE = {
   TODO_DELETE: 'todo_delete',
   TODO_MOVE: 'todo_move',
   TODO_RESULT: 'todo_result',
+  // Todo tracks (categories) (device <-> orchestrator)
+  TRACK_LIST: 'track_list',
+  TRACK_CREATE: 'track_create',
+  TRACK_UPDATE: 'track_update',
+  TRACK_DELETE: 'track_delete',
+  TRACK_RESULT: 'track_result',
   // Telegram saved messages (device <-> orchestrator)
   TELEGRAM_SAVED: 'telegram_saved',
   TELEGRAM_SAVED_RESULT: 'telegram_saved_result',

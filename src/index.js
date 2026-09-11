@@ -872,11 +872,17 @@ function handleDeviceConnection(ws, request) {
       return;
     }
 
+    const sendTodos = async () => safeSend({ type: MSG_TYPE.TODO_RESULT, action: 'list', todos: await todoStore.list() });
+    const sendTracks = async () => safeSend({ type: MSG_TYPE.TRACK_RESULT, action: 'list', tracks: await todoStore.listTracks() });
+    const sendTrackError = (op, err) => {
+      console.error(`[server] ${op} failed:`, err.message);
+      safeSend({ type: MSG_TYPE.TRACK_RESULT, action: 'error', error: err.message });
+    };
+
     // Todo: list
     if (envelope.type === MSG_TYPE.TODO_LIST) {
       try {
-        const todos = await todoStore.list();
-        safeSend({ type: MSG_TYPE.TODO_RESULT, action: 'list', todos });
+        await sendTodos();
       } catch (err) {
         console.error('[server] todo_list failed:', err.message);
         safeSend({ type: MSG_TYPE.ERROR, message: err.message });
@@ -886,9 +892,8 @@ function handleDeviceConnection(ws, request) {
     // Todo: create
     if (envelope.type === MSG_TYPE.TODO_CREATE) {
       try {
-        await todoStore.create(envelope.text);
-        const todos = await todoStore.list();
-        safeSend({ type: MSG_TYPE.TODO_RESULT, action: 'list', todos });
+        await todoStore.create(envelope.text, envelope.trackId);
+        await sendTodos();
       } catch (err) {
         console.error('[server] todo_create failed:', err.message);
         safeSend({ type: MSG_TYPE.ERROR, message: err.message });
@@ -903,8 +908,7 @@ function handleDeviceConnection(ws, request) {
         if (envelope.completed !== undefined) fields.completed = envelope.completed;
         if (envelope.priority !== undefined) fields.priority = envelope.priority;
         await todoStore.update(envelope.id, fields);
-        const todos = await todoStore.list();
-        safeSend({ type: MSG_TYPE.TODO_RESULT, action: 'list', todos });
+        await sendTodos();
       } catch (err) {
         console.error('[server] todo_update failed:', err.message);
         safeSend({ type: MSG_TYPE.ERROR, message: err.message });
@@ -915,8 +919,7 @@ function handleDeviceConnection(ws, request) {
     if (envelope.type === MSG_TYPE.TODO_DELETE) {
       try {
         await todoStore.remove(envelope.id);
-        const todos = await todoStore.list();
-        safeSend({ type: MSG_TYPE.TODO_RESULT, action: 'list', todos });
+        await sendTodos();
       } catch (err) {
         console.error('[server] todo_delete failed:', err.message);
         safeSend({ type: MSG_TYPE.ERROR, message: err.message });
@@ -926,13 +929,45 @@ function handleDeviceConnection(ws, request) {
     // Todo: move (reorder)
     if (envelope.type === MSG_TYPE.TODO_MOVE) {
       try {
-        await todoStore.move(envelope.id, envelope.position);
-        const todos = await todoStore.list();
-        safeSend({ type: MSG_TYPE.TODO_RESULT, action: 'list', todos });
+        await todoStore.move(envelope.id, envelope.position, envelope.trackId);
+        await sendTodos();
       } catch (err) {
         console.error('[server] todo_move failed:', err.message);
         safeSend({ type: MSG_TYPE.ERROR, message: err.message });
       }
+    }
+
+    // Track: list
+    if (envelope.type === MSG_TYPE.TRACK_LIST) {
+      try { await sendTracks(); }
+      catch (err) { sendTrackError('track_list', err); }
+    }
+
+    // Track: create
+    if (envelope.type === MSG_TYPE.TRACK_CREATE) {
+      try {
+        await todoStore.createTrack({ name: envelope.name, color: envelope.color });
+        await sendTracks();
+      } catch (err) { sendTrackError('track_create', err); }
+    }
+
+    // Track: update
+    if (envelope.type === MSG_TYPE.TRACK_UPDATE) {
+      try {
+        const fields = {};
+        if (envelope.name !== undefined) fields.name = envelope.name;
+        if (envelope.color !== undefined) fields.color = envelope.color;
+        await todoStore.updateTrack(envelope.id, fields);
+        await sendTracks();
+      } catch (err) { sendTrackError('track_update', err); }
+    }
+
+    // Track: delete
+    if (envelope.type === MSG_TYPE.TRACK_DELETE) {
+      try {
+        await todoStore.deleteTrack(envelope.id);
+        await sendTracks();
+      } catch (err) { sendTrackError('track_delete', err); }
     }
 
     // Job: list
